@@ -16,4 +16,4 @@ requests==2.34.2
 # ipykernel is what lets you select the .venv kernel for walkthrough.ipynb.
 # jupyterlab is optional: only needed to run the notebook outside an IDE.
 ipykernel==7.3.0
-jupyterlab==4.4.10
+jupyterlab==4.5.10

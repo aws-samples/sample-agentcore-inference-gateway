@@ -1,0 +1,19 @@
+# AgentCore Gateway Inference Governance Pilot — dependencies
+# Install into the project virtualenv only:
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# --- Infrastructure (CDK) ---
+aws-cdk-lib==2.268.0
+constructs==10.8.1
+
+# --- Client used by the notebook walkthrough ---
+# boto3: Cognito InitiateAuth (called UNSIGNED — no AWS credentials needed)
+# requests: plain HTTPS calls to the gateway with a bearer token
+boto3==1.43.89
+requests==2.34.2
+
+# --- Notebook walkthrough ---
+# ipykernel is what lets you select the .venv kernel for walkthrough.ipynb.
+# jupyterlab is optional: only needed to run the notebook outside an IDE.
+ipykernel==7.3.0
+jupyterlab==4.4.10

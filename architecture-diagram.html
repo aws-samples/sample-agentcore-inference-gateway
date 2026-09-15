@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentCore Gateway — Unified Inference Governance Plane</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#30363d;
+    --tx:#e6edf3; --dim:#8b949e; --acc:#58a6ff;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --vio:#bc8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       padding:28px 22px 60px}
+  .wrap{max-width:1180px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--dim);margin:0 0 22px;font-size:13px}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 24px;font-size:12px;color:var(--dim)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .band{border:1px solid var(--line);border-radius:12px;background:var(--panel);
+        padding:14px 16px;margin:0 0 14px}
+  .band > .hdr{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:var(--dim);
+               margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .box{flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--line);
+       border-radius:9px;padding:11px 13px}
+  .box h4{margin:0 0 5px;font-size:13px}
+  .box p{margin:0;color:var(--dim);font-size:12px}
+  .box code, code{background:#0d1117;border:1px solid var(--line);border-radius:4px;
+                  padding:0 4px;font-size:11.5px;color:var(--tx)}
+  .arrow{text-align:center;color:var(--dim);font-size:18px;margin:2px 0 8px;letter-spacing:2px}
+  /* ordered enforcement layers */
+  .layer{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--line);
+         border-radius:9px;padding:11px 13px;margin:0 0 9px;background:var(--panel2)}
+  .layer .n{flex:0 0 26px;height:26px;border-radius:50%;background:#0d1117;
+            border:1px solid var(--line);display:flex;align-items:center;justify-content:center;
+            font-size:12px;font-weight:700;color:var(--acc)}
+  .layer .body{flex:1;min-width:0}
+  .layer h4{margin:0 0 3px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .layer p{margin:0;color:var(--dim);font-size:12px}
+  .tag{font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid var(--line);
+       color:var(--dim);white-space:nowrap}
+  .tag.both{color:var(--ok);border-color:#1d4429}
+  .tag.mantle{color:var(--warn);border-color:#4a3a12}
+  .tag.buf{color:var(--vio);border-color:#3d2a5c}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .up{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:var(--panel2)}
+  .up h4{margin:0 0 4px;font-size:13px}
+  .up p{margin:0 0 4px;color:var(--dim);font-size:12px}
+  .note{border-left:3px solid var(--acc);background:#11161f;border-radius:0 8px 8px 0;
+        padding:10px 13px;margin:14px 0 0;font-size:12.5px;color:var(--dim)}
+  .note b{color:var(--tx)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  .foot{color:var(--dim);font-size:12px;margin-top:26px;border-top:1px solid var(--line);
+        padding-top:14px}
+  @media (max-width:760px){ .split{grid-template-columns:1fr} }
+
+  /* ---- end-to-end SVG flow ---- */
+  .svgwrap{border:1px solid var(--line);border-radius:12px;background:#0f141c;
+           padding:12px 10px 6px;margin:0 0 10px;overflow-x:auto}
+  .svgwrap svg{width:100%;height:auto;min-width:900px;display:block}
+  .cap{color:var(--dim);font-size:12px;margin:0 0 26px}
+  .annex{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:var(--dim);
+         font-weight:600;margin:30px 0 12px;padding-top:16px;border-top:1px solid var(--line)}
+  svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .t-plane{font-size:11px;letter-spacing:1.1px;font-weight:700;fill:#8b949e}
+  .t-ttl{font-size:12.5px;font-weight:600;fill:#e6edf3}
+  .t-ttl-sm{font-size:11px;font-weight:600;fill:#e6edf3}
+  .t-gw{font-size:14px;font-weight:700;fill:#e6edf3}
+  .t-sub{font-size:9.5px;fill:#8b949e}
+  .t-hdr{font-size:9.5px;letter-spacing:.8px;font-weight:700;fill:#8b949e}
+  .t-num{font-size:11px;font-weight:700;fill:#58a6ff}
+  .t-lbl{font-size:9px;fill:#8b949e}
+  .t-lbl-s{font-size:8.5px;fill:#8b949e}
+  .t-mono{font-size:9px;fill:#a9b6c4;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  .bx{fill:#1c2230;stroke:#30363d;stroke-width:1}
+  .bx-gw{fill:#12171f;stroke:#58a6ff;stroke-width:1.5}
+  .bx-acc{fill:#182233;stroke:#58a6ff;stroke-width:1.3}
+  .bx-warn{fill:#1c2230;stroke:#4a3a12;stroke-width:1}
+  .bx-grp{fill:#141a24;stroke:#30363d;stroke-width:1;stroke-dasharray:5 4}
+  .bx-note{fill:#11161f;stroke:#30363d;stroke-width:1}
+  .ln{stroke:#58a6ff;stroke-width:1.7;fill:none;marker-end:url(#ah)}
+  .ln-d{stroke:#8b949e;stroke-width:1.3;fill:none;stroke-dasharray:4 4;marker-end:url(#ahd)}
+  .ln-p{stroke:#8b949e;stroke-width:1.3;fill:none;stroke-dasharray:4 4}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>AgentCore Gateway — Unified Inference Governance Plane</h1>
+  <p class="sub"><b>How it works, in depth.</b> One governed front door for serverless inference,
+     enforced identically across <b>bedrock-mantle</b> and <b>bedrock-runtime</b>. Every element
+     below is deployed by CDK and verified against live infrastructure.
+     <br>Start at <code>README.md</code> for what this is and how to deploy it; see
+     <code>docs/FINDINGS.md</code> for <em>why</em> each mechanism was chosen over the obvious
+     alternative.</p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--ok)"></i> works on both surfaces</span>
+    <span><i class="dot" style="background:var(--bad)"></i> fails closed if it cannot decide</span>
+    <span><i class="dot" style="background:var(--vio)"></i> forces response buffering</span>
+    <span style="color:#58a6ff">──▶ request path</span>
+    <span>┄┄▶ control / return path</span>
+  </div>
+
+  <!-- END-TO-END FLOW (SVG) -->
+  <div class="svgwrap">
+  <svg viewBox="0 0 1240 890" role="img"
+       aria-label="End-to-end architecture: an inference client authenticates with Cognito and calls a single AgentCore Gateway endpoint using any supported inference API shape. The gateway applies five ordered enforcement layers, two of which are Lambda interceptors, then dispatches to bedrock-mantle or bedrock-runtime. A control plane below holds governance policy, cost state and a daily-refreshed model price list in DynamoDB, written by a Cognito-authenticated admin console, and both interceptors write structured records to one central CloudWatch audit log.">
+    <defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5"
+              orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6"
+              orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- DATA PLANE -->
+    <text class="t-plane" x="20" y="26">DATA PLANE &#183; EVERY INFERENCE REQUEST</text>
+
+    <!-- inference client -->
+    <rect class="bx" x="20" y="52" width="170" height="140" rx="8"/>
+    <text class="t-ttl" x="34" y="74">Inference client</text>
+    <text class="t-sub" x="34" y="91">notebook &#183; curl &#183; SDK</text>
+    <text class="t-mono" x="34" y="106">Bearer &lt;access token&gt;</text>
+    <text class="t-sub" x="34" y="121">no AWS credentials</text>
+    <text class="t-sub" x="34" y="141" style="fill:#e6edf3">ANY of these API shapes:</text>
+    <text class="t-mono" x="34" y="155">/inference/v1/messages</text>
+    <text class="t-mono" x="34" y="168">/inference/v1/chat/...</text>
+    <text class="t-mono" x="34" y="181">/inference/v1/responses</text>
+
+    <!-- cognito -->
+    <rect class="bx" x="20" y="208" width="170" height="94" rx="8"/>
+    <text class="t-ttl" x="34" y="230">Amazon Cognito</text>
+    <text class="t-sub" x="34" y="247">self-contained IdP (CDK)</text>
+    <text class="t-mono" x="34" y="263">USER_PASSWORD_AUTH</text>
+    <text class="t-sub" x="34" y="280">group: ai-platform &#8594; access</text>
+    <text class="t-sub" x="34" y="295">groups are the only axis</text>
+
+    <path class="ln"   d="M75,192 V206"/>
+    <path class="ln-d" d="M135,208 V194"/>
+    <text class="t-lbl-s" x="196" y="194">login &#8594;</text>
+    <text class="t-lbl-s" x="196" y="207">&#8592; token</text>
+
+    <!-- client -> gateway -->
+    <text class="t-lbl" x="260" y="88" text-anchor="middle">POST &#183; Bearer token</text>
+    <path class="ln" d="M190,96 H328"/>
+    <path class="ln-d" d="M330,124 H192"/>
+    <text class="t-lbl" x="260" y="141" text-anchor="middle">200 &#183; 403 &#183; 429</text>
+
+    <!-- cognito -> gateway (token validation) -->
+    <text class="t-lbl-s" x="260" y="247" text-anchor="middle">discovery + JWKS</text>
+    <path class="ln-d" d="M190,255 H328"/>
+
+    <!-- GATEWAY -->
+    <rect class="bx-gw" x="330" y="40" width="380" height="306" rx="11"/>
+    <text class="t-gw" x="346" y="65">AgentCore Gateway</text>
+    <text class="t-sub" x="346" y="81">one endpoint &#183; one execution role &#183; ordered enforcement</text>
+
+    <!-- FOUR ordered layers. There used to be five: a native token rate limit sat
+         between the request interceptor and Cedar. It was deleted — it only attached on
+         recognised inference paths, so it never metered the runtime passthrough at all. -->
+    <!-- layer 1 -->
+    <rect class="bx" x="344" y="92" width="352" height="50" rx="7"/>
+    <circle cx="364" cy="117" r="11" fill="#0d1117" stroke="#30363d"/>
+    <text class="t-num" x="364" y="121" text-anchor="middle">1</text>
+    <text class="t-ttl-sm" x="384" y="111">CUSTOM_JWT authorizer</text>
+    <text class="t-sub" x="384" y="125">issuer via discovery URL &#183; allowed_clients only (no aud)</text>
+
+    <!-- layer 2 -->
+    <rect class="bx-acc" x="344" y="156" width="352" height="50" rx="7"/>
+    <circle cx="364" cy="181" r="11" fill="#0d1117" stroke="#58a6ff"/>
+    <text class="t-num" x="364" y="185" text-anchor="middle">2</text>
+    <text class="t-ttl-sm" x="384" y="175">REQUEST interceptor &#8594; Lambda
+      <tspan style="fill:#f85149;font-size:9px"> &#160;FAIL CLOSED</tspan></text>
+    <text class="t-sub" x="384" y="189">model known &#183; model access &#183; rate &#183; cost &#183; guardrail</text>
+    <text class="t-sub" x="384" y="201">runs FIRST, on <tspan style="fill:#e6edf3">every API shape and both surfaces</tspan></text>
+
+    <!-- layer 3 -->
+    <rect class="bx" x="344" y="220" width="352" height="50" rx="7"/>
+    <circle cx="364" cy="245" r="11" fill="#0d1117" stroke="#30363d"/>
+    <text class="t-num" x="364" y="249" text-anchor="middle">3</text>
+    <text class="t-ttl-sm" x="384" y="239">Cedar policy engine</text>
+    <text class="t-sub" x="384" y="253">ONE boolean: group authorization &#183; <tspan style="fill:#e6edf3">cannot time out</tspan></text>
+
+    <!-- layer 4 -->
+    <rect class="bx-acc" x="344" y="284" width="352" height="50" rx="7"/>
+    <circle cx="364" cy="309" r="11" fill="#0d1117" stroke="#58a6ff"/>
+    <text class="t-num" x="364" y="313" text-anchor="middle">4</text>
+    <text class="t-ttl-sm" x="384" y="303">RESPONSE interceptor &#8594; Lambda</text>
+    <text class="t-sub" x="384" y="317">true output-token cost &#183; buffers streaming</text>
+
+    <!-- UPSTREAMS -->
+    <text class="t-lbl" x="795" y="110" text-anchor="middle">SigV4 &#183; gateway exec role</text>
+    <path class="ln" d="M710,118 H878"/>
+    <path class="ln-d" d="M880,152 H712"/>
+    <text class="t-lbl-s" x="795" y="169" text-anchor="middle">response</text>
+
+    <rect class="bx" x="880" y="60" width="340" height="130" rx="9"/>
+    <text class="t-ttl" x="896" y="84">bedrock-mantle</text>
+    <text class="t-sub" x="896" y="101">inference target &#8212; PROVIDER config (default path)</text>
+    <text class="t-sub" x="896" y="117">unified serverless surface &#183; 110+ models, ~12 providers</text>
+    <text class="t-mono" x="896" y="134">/inference/v1/messages</text>
+    <text class="t-mono" x="896" y="150">anthropic.claude-sonnet-5</text>
+    <text class="t-sub" x="896" y="168" style="font-size:8.5px">signing service <tspan style="fill:#e6edf3">derived from hostname</tspan>: bedrock-mantle</text>
+    <text class="t-sub" x="896" y="181" style="font-size:8.5px">a connector target is also deployed, for comparison</text>
+
+    <text class="t-lbl" x="795" y="272" text-anchor="middle">SigV4 &#183; gateway exec role</text>
+    <path class="ln" d="M710,280 H878"/>
+    <path class="ln-d" d="M880,312 H712"/>
+
+    <rect class="bx" x="880" y="216" width="340" height="130" rx="9"/>
+    <text class="t-ttl" x="896" y="240">bedrock-runtime</text>
+    <text class="t-sub" x="896" y="257">HTTP passthrough target (cannot be an inference target)</text>
+    <text class="t-sub" x="896" y="273">InvokeModel &#183; cross-region inference profiles</text>
+    <text class="t-mono" x="896" y="290">/bedrockrt/model/&lt;modelId&gt;/invoke</text>
+    <text class="t-mono" x="896" y="306">us.anthropic.claude-sonnet-5</text>
+    <text class="t-sub" x="896" y="324" style="font-size:8.5px">signing service <tspan style="fill:#e6edf3">explicitly overridden</tspan> to bedrock, because</text>
+    <text class="t-sub" x="896" y="337" style="font-size:8.5px">hostname derivation would give bedrock-runtime and fail</text>
+
+    <!-- CONTROL PLANE -->
+    <text class="t-plane" x="20" y="378">CONTROL PLANE &#183; POLICY &amp; COST STATE</text>
+
+    <!-- gateway <-> request interceptor -->
+    <path class="ln"   d="M390,346 V388"/>
+    <path class="ln-d" d="M425,390 V348"/>
+    <text class="t-lbl-s" x="435" y="367">invoke &#8594; verdict</text>
+
+    <!-- gateway <-> response interceptor -->
+    <path class="ln"   d="M600,346 V388"/>
+    <path class="ln-d" d="M635,390 V348"/>
+    <text class="t-lbl-s" x="645" y="367">body &#8594; usage</text>
+
+    <!-- request interceptor -->
+    <rect class="bx-acc" x="290" y="390" width="200" height="100" rx="9"/>
+    <text class="t-ttl-sm" x="304" y="412">REQUEST interceptor</text>
+    <text class="t-sub" x="304" y="429">Lambda &#183; pre-dispatch &#183; JWT</text>
+    <text class="t-sub" x="304" y="445">_normalize() reduces ANY</text>
+    <text class="t-sub" x="304" y="461">body shape to one contract</text>
+    <text class="t-sub" x="304" y="480" style="font-size:8.5px;fill:#f85149">403 model/guardrail &#183; 429 rate/cost</text>
+
+    <!-- response interceptor -->
+    <rect class="bx-acc" x="520" y="390" width="200" height="100" rx="9"/>
+    <text class="t-ttl-sm" x="534" y="412">RESPONSE interceptor</text>
+    <text class="t-sub" x="534" y="429">Lambda &#183; post-dispatch</text>
+    <text class="t-sub" x="534" y="445">usage (JSON + SSE), priced</text>
+    <text class="t-sub" x="534" y="461">from the pricing table</text>
+    <text class="t-sub" x="534" y="477">joins on REQUEST_ID (no JWT)</text>
+
+    <path class="ln-d" d="M390,490 V518"/>
+    <text class="t-lbl-s" x="398" y="512">read + charge</text>
+    <path class="ln-d" d="M620,490 V518"/>
+    <text class="t-lbl-s" x="628" y="512">reconcile</text>
+
+    <!-- governance state group -->
+    <rect class="bx-grp" x="290" y="520" width="430" height="210" rx="10"/>
+    <text class="t-hdr" x="306" y="541">GOVERNANCE STATE &#8212; DYNAMODB</text>
+
+    <rect class="bx" x="306" y="552" width="195" height="94" rx="7"/>
+    <text class="t-ttl-sm" x="318" y="573">governance-config</text>
+    <text class="t-sub" x="318" y="589">pk = scope:</text>
+    <text class="t-mono" x="318" y="603">DEFAULT|GROUP#|USER#</text>
+    <text class="t-sub" x="318" y="619">sk = kind:</text>
+    <text class="t-mono" x="318" y="633" style="font-size:8px">MODELS|RATELIMIT|BUDGET|GUARDRAIL</text>
+
+    <rect class="bx" x="509" y="552" width="195" height="94" rx="7"/>
+    <text class="t-ttl-sm" x="521" y="573">cost-ledger</text>
+    <text class="t-sub" x="521" y="589">four kinds in one table:</text>
+    <text class="t-mono" x="521" y="603" style="font-size:8px">spend &#183; PENDING# &#183; RATE# &#183; DECISION#</text>
+    <text class="t-sub" x="521" y="619">rate counters live here too,</text>
+    <text class="t-sub" x="521" y="634">pooled per scope on request</text>
+
+    <rect class="bx" x="306" y="654" width="398" height="68" rx="7"/>
+    <text class="t-ttl-sm" x="318" y="675">model-pricing</text>
+    <text class="t-sub" x="318" y="691">pk = model_key &#183; in/out + cache read/write price per 1K tokens</text>
+    <text class="t-sub" x="318" y="706">refreshed DAILY from the AWS Price List API (EventBridge &#8594; Lambda)</text>
+    <text class="t-sub" x="318" y="718" style="font-size:8.5px">the hardcoded constants it replaced were 3x high on opus-5</text>
+
+    <!-- admin browser -->
+    <rect class="bx" x="790" y="390" width="210" height="100" rx="9"/>
+    <text class="t-ttl-sm" x="804" y="412">Admin browser</text>
+    <text class="t-sub" x="804" y="429">governance console UI</text>
+    <text class="t-sub" x="804" y="445">model access &#183; budgets &#183;</text>
+    <text class="t-sub" x="804" y="461">guardrails &#183; statistics</text>
+    <text class="t-sub" x="804" y="480">separate identity from callers</text>
+
+    <path class="ln" d="M895,490 V518"/>
+    <text class="t-lbl-s" x="903" y="512">Cognito login</text>
+
+    <!-- admin console -->
+    <rect class="bx" x="790" y="520" width="210" height="140" rx="9"/>
+    <text class="t-ttl-sm" x="804" y="542">Admin console</text>
+    <text class="t-sub" x="804" y="559">API Gateway HTTP API</text>
+    <text class="t-sub" x="804" y="574">&#8594; Lambda (SPA + JSON API)</text>
+    <text class="t-sub" x="804" y="594">authz in code: GetUser, then</text>
+    <text class="t-mono" x="804" y="609">gateway-admins</text>
+    <text class="t-sub" x="804" y="631" style="fill:#f85149">the public surface is API GW,</text>
+    <text class="t-sub" x="804" y="645" style="fill:#f85149">never the Lambda itself</text>
+
+    <text class="t-lbl-s" x="755" y="582" text-anchor="middle">writes policy</text>
+    <path class="ln-d" d="M788,590 H722"/>
+
+    <!-- notes -->
+    <rect class="bx-note" x="1030" y="390" width="190" height="100" rx="9"/>
+    <text class="t-ttl-sm" x="1044" y="412">Policy is runtime state</text>
+    <text class="t-sub" x="1044" y="430">Infrastructure stays in CDK.</text>
+    <text class="t-sub" x="1044" y="445">Policy data does not, so an</text>
+    <text class="t-sub" x="1044" y="460">admin edit is enforced in</text>
+    <text class="t-sub" x="1044" y="475">~10s with no deployment.</text>
+
+    <rect class="bx-note" x="1030" y="520" width="190" height="140" rx="9"/>
+    <text class="t-ttl-sm" x="1044" y="542">Why decision records</text>
+    <text class="t-sub" x="1044" y="560">Gateway spans carry no</text>
+    <text class="t-sub" x="1044" y="575">identity and no token</text>
+    <text class="t-sub" x="1044" y="590">counts &#8212; and interceptor</text>
+    <text class="t-sub" x="1044" y="605">short-circuits are not</text>
+    <text class="t-sub" x="1044" y="620">spanned at all. Measured:</text>
+    <text class="t-sub" x="1044" y="635">10 decisions, 6 denials,</text>
+    <text class="t-sub" x="1044" y="650">against one 403 span.</text>
+
+    <!-- AUDIT LOG -->
+    <text class="t-plane" x="20" y="760">THE SECURITY RECORD &#183; ONE PLACE TO SEARCH</text>
+
+    <!-- BOTH interceptors feed the one log group; the feeds merge and run down the
+         left gutter so nothing crosses the admin console's write path. -->
+    <path class="ln-p" d="M290,450 H274"/>
+    <path class="ln-p" d="M600,490 V503 H274"/>
+    <path class="ln-d" d="M272,450 V813 H286"/>
+    <text class="t-lbl-s" x="196" y="596">every decision</text>
+    <text class="t-lbl-s" x="196" y="609">+ every response</text>
+
+    <rect class="bx-acc" x="290" y="768" width="930" height="110" rx="9"/>
+    <text class="t-ttl-sm" x="306" y="790">Central governance audit log
+      <tspan class="t-mono" style="fill:#a9b6c4"> &#160;CloudWatch &#183; /acgw-pilot/governance-audit</tspan></text>
+    <text class="t-sub" x="306" y="808">Both interceptors are pointed at this ONE log group via the Lambda</text>
+    <text class="t-mono" x="306" y="822">logGroup</text>
+    <text class="t-sub" x="352" y="822">property, so the REQUEST and RESPONSE records</text>
+    <text class="t-sub" x="306" y="836">for a single call join on <tspan class="t-mono" style="fill:#a9b6c4">request_id</tspan>. Retained 90 days &#8212; the</text>
+    <text class="t-sub" x="306" y="850">DynamoDB decision records TTL out after 24 hours. A CloudWatch</text>
+    <text class="t-sub" x="306" y="864">data protection policy masks 8 identifier types at ingest.</text>
+
+    <text class="t-sub" x="760" y="808" style="fill:#e6edf3">Every record carries:</text>
+    <text class="t-mono" x="760" y="822">username &#183; sub &#183; groups &#183; client_id &#183; source_ip &#183; surface &#183; model</text>
+    <text class="t-mono" x="760" y="836">api_shape &#183; verb &#183; decision &#183; status &#183; scope &#183; fail_open/fail_closed</text>
+    <text class="t-mono" x="760" y="850">prompt_sha256 &#183; prompt_chars &#183; response_sha256 &#183; response_chars</text>
+    <text class="t-mono" x="760" y="864">tool_specs &#183; tool_invocations &#183; response_tool_calls &#183; tokens &#183; cost_usd</text>
+  </svg>
+  </div>
+  <p class="cap">Layers <b>1&ndash;4</b> execute in that order, so the first layer to object is the status the
+     caller sees. There used to be a fifth &mdash; a native token rate limit between layers 2 and 3
+     &mdash; and <b>deleting it is the point</b>: it attached only on recognised inference paths, so it
+     never metered the runtime passthrough. With it gone the interceptor is the only layer that can
+     return a <code>429</code>, which makes verdicts identical on both surfaces by construction rather
+     than by ordering luck. Note that <b>both</b> upstream hops are SigV4-signed with the same gateway
+     execution role &mdash; the caller never holds AWS credentials either way. The two differ only in
+     <em>target type</em> and therefore in how the SigV4 <em>service name</em> is set.
+     Detail for every element follows.</p>
+
+  <div class="note" style="margin:0 0 12px;border-left-color:var(--bad)">
+    <b>Layer 2 is fail closed.</b> If it cannot establish policy &mdash; a config read fails, a
+    counter write fails, <code>ApplyGuardrail</code> errors, or it runs short of invocation budget
+    &mdash; it returns <code>403</code> rather than forwarding the request. Two mechanisms hold that
+    invariant:
+    <br><br>
+    <b>1. A self-imposed deadline.</b> Before each control the interceptor checks
+    <code>context.get_remaining_time_in_millis()</code> against that control's estimated cost plus a
+    safety margin, and denies with <code>403 governance_timeout</code> if there is not enough left.
+    The Lambda timeout (20s) is <b>headroom</b>, not a deadline &mdash; sized so the internal check
+    always fires first, because the function must never be killed mid-flight.
+    <br><br>
+    <b>2. A thin wrapper.</b> <code>handler()</code> does nothing but call the governance body and
+    convert anything it raises into a typed <code>403</code>. A control added later therefore cannot
+    introduce a fail-open path by forgetting to handle something.
+    <br><br>
+    Denials distinguish <em>"you are not allowed"</em> from <em>"we could not establish whether you
+    are allowed"</em>. <code>model_access_denied</code> is a user meeting policy;
+    <code>governance_unavailable</code> and <code>governance_timeout</code> are operational failures
+    and should be alarmed on separately.
+    <br><br>
+    <b>Why this is not the gateway default:</b> an interceptor that times out makes the gateway
+    return <code>200</code> with the model invoked and no governance applied. That is measured,
+    undocumented, and not configurable &mdash; see <code>docs/FINDINGS.md</code>.
+  </div>
+
+  <div class="note" style="margin:0 0 12px">
+    <b>Layer 2 is also retry-safe and recoverable.</b> The AgentCore devguide states the gateway
+    <em>"may retry requests to interceptor Lambda functions in case of failures or timeouts"</em>, and
+    both mutating controls are DynamoDB <code>ADD</code> operations, so a retry would double-charge.
+    The request id is claimed with a conditional write before the first mutation; a retry replays the
+    stored verdict instead of re-applying it. A retry whose first attempt recorded no outcome fails
+    closed, because there is no way to know whether it already charged.
+    <br><br>
+    Because the whole plane is fail closed, a <code>(DEFAULT, BREAKGLASS)</code> config row can
+    bypass enforcement within the config cache TTL (~10s), no deployment. It is checked
+    <em>before</em> the body is parsed, so it works even when the interceptor is rejecting malformed
+    input. Every bypassed request is recorded with who set it and why.
+  </div>
+
+  <div class="note" style="margin:0 0 26px">
+    <b>Governance does not depend on the API shape.</b> The gateway routes three inference
+    contracts &mdash; <code>/inference/v1/messages</code>,
+    <code>/inference/v1/chat/completions</code> and <code>/inference/v1/responses</code> &mdash;
+    plus the runtime passthrough path, and each spells the prompt and the model differently: the
+    model arrives in the body <em>or</em> in the URL, and the prompt lives in
+    <code>messages[]</code>, <code>input</code>/<code>instructions</code>, or a bare
+    <code>prompt</code>.
+    <br><br>
+    A single <code>_normalize()</code> reduces whatever arrived to one internal contract
+    &mdash; <em>model, text units, tool specs, output ceiling</em> &mdash; and every control reads
+    that rather than the raw body. Text is harvested by <b>structure</b>, walking text-bearing keys
+    recursively so tool results and nested content blocks yield their text, while opaque keys
+    (<code>bytes</code>, <code>source</code>, <code>s3Location</code>) are skipped so image base64 is
+    never scanned. Path matching is generic in the <em>verb</em>, so a new runtime operation still
+    resolves its model, and a model that cannot be resolved fails closed.
+    <br><br>
+    Measured on the deployed stack: the same entitlement denial returns <code>403</code> through the
+    Anthropic Messages shape, the OpenAI chat shape, the Responses shape, the runtime path, and all
+    four runtime verbs &mdash; and a prompt injection hidden inside a Converse
+    <code>toolResult</code> is caught. Every one produces an audit record naming the shape.
+  </div>
+
+  <div class="annex">Element detail &mdash; how each layer works</div>
+
+  <!-- CLIENTS -->
+  <div class="band">
+    <div class="hdr">Clients &amp; identity</div>
+    <div class="row">
+      <div class="box">
+        <h4>Inference client</h4>
+        <p>Jupyter walkthrough, or any base-URL + bearer client (curl, OpenAI SDK, Anthropic
+           SDK). <code>boto3 invoke_model</code> is <em>not</em> the path — this is an
+           LLM-provider REST API.</p>
+      </div>
+      <div class="box">
+        <h4>Admin browser</h4>
+        <p>Governance console. Signs in with Cognito and must belong to
+           <code>gateway-admins</code>.</p>
+      </div>
+      <div class="box">
+        <h4>Amazon Cognito &mdash; CDK-provisioned IdP</h4>
+        <p>Browser-free <code>USER_PASSWORD_AUTH</code>, no client secret, so the notebook logs in
+           with <code>boto3 initiate_auth</code> and no AWS credentials.</p>
+        <p><b>Group membership is the only identity axis.</b> <code>cognito:groups</code> is already
+           present in a standard access token, so the pool runs on <code>FeaturePlan.LITE</code>
+           with no custom attributes and no pre-token-generation trigger. Everything else &mdash;
+           models, rate, budget, guardrail &mdash; resolves from the config table at request time.</p>
+      </div>
+    </div>
+    <div class="note">
+      <b>Authorizer configuration that matters.</b> Cognito <em>access</em> tokens carry no
+      <code>aud</code> claim — the client identity is in <code>client_id</code>. The gateway
+      authorizer must therefore use <code>allowed_clients</code> <b>only</b>; setting
+      <code>allowed_audience</code> demands a match that never succeeds. Inbound JWT validation is
+      handled by AgentCore Identity and runs before interceptors, the policy engine and targets.
+    </div>
+  </div>
+
+  <div class="arrow">│ &nbsp; Authorization: Bearer &lt;access token&gt; &nbsp; ▼</div>
+
+  <!-- GATEWAY -->
+  <div class="band">
+    <div class="hdr">AgentCore Gateway — single endpoint, ordered enforcement</div>
+
+    <div class="layer">
+      <div class="n">1</div>
+      <div class="body">
+        <h4>CUSTOM_JWT authorizer <span class="tag both">both surfaces</span></h4>
+        <p>Validates issuer via the Cognito discovery URL and the app client via
+           <code>allowed_clients</code>. Claims become Cedar principal <b>tags</b>.</p>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="n">2</div>
+      <div class="body">
+        <h4>REQUEST interceptor (Lambda) — runs first
+            <span class="tag both">both surfaces</span></h4>
+        <p><code>_normalize()</code> first reduces whatever the caller sent — any path, any
+           body shape — to one internal contract: <em>model, text units, tool specs, output
+           ceiling</em>. Every control below reads that, never the raw body.<br>
+           <b>Model must be known</b> · unresolvable → <code>403 model_unresolved</code>,
+           <b>fail closed</b><br>
+           <b>Model access</b> · allow/deny globs from the config table → <code>403</code><br>
+           <b>Rate limit</b> · fixed-window request + token counters per scope, optionally
+           <b>pooled</b> across a group → <code>429</code><br>
+           <b>Cost budget</b> · reserves worst-case output cost from the resolved output
+           ceiling, charges the ledger → <code>429</code><br>
+           <b>Guardrail</b> · calls <code>ApplyGuardrail</code> on the harvested text →
+           <code>403</code>, model never invoked<br>
+           Writes a decision record and an audit record for <em>every</em> request.</p>
+        <p><b>Fail closed throughout.</b> <code>handler()</code> is a thin wrapper that does nothing
+           but call the governance body and convert anything it raises into a typed
+           <code>403</code> — so a control added later cannot introduce a fail-open path by
+           forgetting to handle something. A self-imposed deadline is checked before each control,
+           and every dependency call carries an explicit connect/read timeout so one hung service
+           cannot consume the budget (<code>ApplyGuardrail</code> gets a single attempt).</p>
+        <p><b>Retry-safe.</b> The devguide warns that the gateway <em>"may retry requests to
+           interceptor Lambda functions in case of failures or timeouts"</em>, and both mutating
+           controls are DynamoDB <code>ADD</code> operations — so a retry would double-charge. The
+           request id is claimed with a conditional write before the first mutation; a retry replays
+           the stored verdict instead of re-applying it.</p>
+        <p><b>One escape hatch.</b> A <code>(DEFAULT, BREAKGLASS)</code> config row bypasses
+           enforcement within the cache TTL (~10s), checked <em>before</em> the body is even parsed —
+           because "the interceptor is rejecting everything" is exactly when you need it. Every
+           bypassed request is recorded with who set it and why.</p>
+      </div>
+    </div>
+
+    <div class="note" style="margin:0 0 9px">
+      <b>There is no native gateway rate limit in this stack.</b> Both were removed, because a native
+      limit attaches only on recognised inference paths (so the runtime passthrough is never metered),
+      counts input tokens only (so it cannot bound generation), and keys on a scalar claim (so a
+      shared team allowance is inexpressible). Verified: <code>ListGatewayRateLimits</code> returns
+      <b>0</b>. Rate limiting is the <code>RATELIMIT</code> config kind in layer 2 instead.
+      <br><br>
+      What serves as a backstop is not another native limit but two structural properties: layer 2 is
+      <b>fail closed</b>, and layer 3 <b>cannot time out</b>. The reasoning, and why keeping a
+      mantle-only limit was rejected, is in <code>docs/FINDINGS.md</code>.
+    </div>
+
+    <div class="layer">
+      <div class="n">3</div>
+      <div class="body">
+        <h4>Cedar policy engine <span class="tag both">both surfaces</span></h4>
+        <p>Governs <b>exactly one boolean</b>: is the caller in the <code>ai-platform</code> group, i.e. may they
+           use this gateway at all. Not which model, not how fast, not how much. Deny-by-default
+           activates once any policy exists, so the set is an explicit <code>permit</code> plus a
+           <code>forbid</code> — and the permit must leave the action <em>unconstrained</em>,
+           because at runtime the action is the HTTP-suffixed child
+           (<code>bedrock___POST:/v1/messages</code>) and a permit scoped to the parent matches
+           nothing.</p>
+        <p><b>Its role in the design</b> is to be the one check that involves none of our code and
+           no Lambda that can time out. Everything expressive lives in layer 2; this layer exists so
+           that a fault in layer 2 still cannot admit a caller who does not belong. Unlike the
+           removed native rate limits, it applies on <b>both</b> surfaces.</p>
+        <p>Cedar <b>cannot see the requested model</b> — which is why entitlement lives in the
+           interceptor and not here.</p>
+        <p class="warn" style="margin-top:6px">⚠️ The membership test is a <b>substring</b> match
+           (<code>like "*ai-platform*"</code>), because <code>cognito:groups</code> is multi-valued
+           and Cedar renders it as an opaque scalar. A group named
+           <code>former-ai-platform-users</code> would also be admitted. Bounded here — passing the
+           gate only reaches the interceptor — but tighten it before pointing this at a real
+           directory.</p>
+      </div>
+    </div>
+
+    <div class="layer">
+      <div class="n">4</div>
+      <div class="body">
+        <h4>RESPONSE interceptor (Lambda) — true-cost reconciliation
+            <span class="tag buf">buffers streaming</span></h4>
+        <p>Normalizes usage across every naming convention the surfaces use
+           (<code>input_tokens</code>, <code>inputTokens</code>, <code>prompt_tokens</code>,
+           and the cache-token variants), prices it from the <b>pricing table</b>, replaces the
+           reservation with actual spend, and enriches the decision record. It also harvests the
+           <em>response</em>: assistant text digest, and which tools the model actually called
+           (as opposed to which tools the caller merely offered). Attribution joins on
+           <code>REQUEST_ID</code> from Lambda client context — the response payload contains
+           <b>no JWT at all</b>. A 2xx it could not account for is emitted as
+           <code>unaccounted_success</code> rather than silently dropped.</p>
+        <p><b>Five billable quantities, not two.</b> Input, output, cache <em>read</em>, and
+           cache <em>write</em> at the <b>5-minute and 1-hour TTL tiers</b> — the 1-hour tier
+           costs 1.6x the 5-minute one, so pricing cache writes as a single line item
+           under-charges any request that used long caching. Where a provider reports only an
+           aggregate (Converse does), it is attributed to the cheaper tier and the record is
+           flagged <code>cache_write_tier_assumed</code>, so assumed spend stays
+           distinguishable from measured spend.</p>
+        <p><b>Settle, never merely release.</b> The rule across both interceptors:
+           <em>no output produced &#8594; refund; output produced but unmeasurable &#8594; keep
+           the worst-case charge.</em> So an unparseable <b>success</b> retains the reservation
+           (a model did generate it), while a <code>4xx</code> refunds — and this is the only
+           layer that can refund a <b>Cedar</b> denial or an upstream error, because both
+           happen after the REQUEST interceptor has already returned ALLOW. Either way the
+           <code>PENDING#</code> row is deleted, so a surviving one always means "in flight"
+           and never "settled".</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- DATA + CONSOLE -->
+  <div class="split">
+    <div class="band" style="margin:0">
+      <div class="hdr">Governance state (DynamoDB)</div>
+      <div class="up" style="margin-bottom:10px">
+        <h4>Governance config table</h4>
+        <p><code>pk</code> = scope: <code>DEFAULT</code> · <code>GROUP#&lt;g&gt;</code> ·
+           <code>USER#&lt;u&gt;</code><br>
+           <code>sk</code> = kind: <code>MODELS</code> · <code>RATELIMIT</code> ·
+           <code>BUDGET</code> · <code>GUARDRAIL</code></p>
+        <p>Resolved <b>USER → GROUP → DEFAULT</b>, per kind. Entitlement is expressed as
+           <em>deny at <code>DEFAULT</code>, permit at <code>GROUP#</code></em> — allow-listing
+           models for a group, with a per-user override where someone needs an exception.
+           <code>RATELIMIT</code> and <code>BUDGET</code> are set at either level too.</p>
+        <p><b>Rules do not merge</b> — only the first matching row for a kind is evaluated. So
+           <code>GROUP#ml-research</code> re-grants opus by carrying its own rule with an
+           <em>empty</em> deny list, not by subtracting from <code>DEFAULT</code>.</p>
+        <p><code>GUARDRAIL</code> stores <code>guardrail_version</code> as well as
+           <code>guardrail_id</code>. They are a pair: one id serves a mutable
+           <code>DRAFT</code> and any number of published versions whose content policies can
+           differ, so an id alone does not say what gets enforced.</p>
+        <p>Policy is <b>runtime state</b>: an admin edit is enforced within the ~10s interceptor
+           cache TTL, no deployment.</p>
+        <div class="note" style="border-left-color:var(--bad)">
+          <b>&#9888; Known gap — multi-group resolution is claim-order dependent.</b> The scope
+          chain walks a user's groups in the order the <em>access token</em> lists them and takes
+          the first row it finds, with no priority field and no merge. Measured: <code>alice</code>
+          is declared <code>[ai-platform, ml-research]</code> with precedence 1 and 2, and the
+          token presents <code>['ml-research', 'ai-platform']</code> — reversed from the
+          declaration and not ascending by precedence. So for a user whose groups both carry a row
+          of the same kind, the winner is decided by an ordering nothing here sets or validates,
+          and it is <b>not</b> "most restrictive wins".
+          <br><br>
+          Latent in this deployment because only one group carries a row of any given kind, and
+          resolution skips scopes with no row for the kind being resolved. It is a documented
+          future enhancement rather than a settled design — see <code>docs/FINDINGS.md</code>.
+          Until it is addressed: one group per kind, with <code>USER#</code> rows for exceptions.
+        </div>
+      </div>
+      <div class="up" style="margin-bottom:10px">
+        <h4>Cost ledger — four record kinds, one table</h4>
+        <p>Spend counters per user per window · <code>PENDING#</code> reservations ·
+           <code>RATE#</code> rate-limit counters · <code>DECISION#</code>, one per request
+           (user, groups, model, decision, status, tokens, true cost, 24h TTL).</p>
+        <p>Every kind expires via the <code>ttl</code> attribute, which is the name the table
+           declares. A timestamp under any other name is just a number &mdash; the rate counters
+           wrote <code>expires_at</code> for a while and were never reaped, invisibly, because
+           the window bucket is part of the key so a stale row is never read again.</p>
+        <p>Plus <code>SEEN#&lt;request_id&gt;</code> idempotency markers. <b>Anything that scans this
+           table must skip the kinds it does not want</b> — a reader that does not will report
+           rate-limit counters as phantom zero-spend users.</p>
+      </div>
+      <div class="up">
+        <h4>Model pricing table</h4>
+        <p><code>pk</code> = normalized <code>model_key</code>; input, output and cache
+           read/write prices. Refreshed <b>daily</b> from the AWS Price List API by a Lambda on
+           an EventBridge schedule, and primed once on create.</p>
+        <p>Prices are runtime state for the same reason policy is: the hardcoded constants this
+           replaced were <b>3x too high on opus-5</b>. Both AWS service codes and both
+           usagetype naming conventions are parsed, including the <code>-mantle-</code>
+           usagetypes.</p>
+      </div>
+    </div>
+
+    <div class="band" style="margin:0">
+      <div class="hdr">Admin console</div>
+      <div class="up" style="margin-bottom:10px">
+        <h4>API Gateway HTTP API → Lambda</h4>
+        <p>Serves a single-file SPA and a JSON API. Authorization happens <b>in code</b>: the
+           caller's access token is validated via <code>GetUser</code>, then
+           <code>gateway-admins</code> membership is required.</p>
+      </div>
+      <div class="up">
+        <h4>Manages</h4>
+        <p>Four screens: <b>Model access</b> · <b>Rate &amp; cost</b> · <b>Guardrails</b> ·
+           <b>Statistics</b>. The first three write the config table the interceptor reads; the
+           fourth reads the decision records.</p>
+        <p>Scope is always chosen from a <b>picker over the real Cognito users and groups</b>,
+           never typed. A free-text <code>GROUP#ml-reserch</code> is accepted by the table and
+           creates a rule that silently never matches — the console would then display policy
+           that does not exist.</p>
+        <p>Because <code>allow: ["*"]</code> next to <code>deny: ["*claude-opus*"]</code> is not
+           self-explanatory, the model-access screen also computes <b>effective access</b>: for a
+           chosen user it shows the scope chain, which scope matched, and per model which glob
+           decided the verdict. It evaluates <b>request-shaped model ids</b>, the same namespace
+           the interceptor matches against — an earlier version used the pricing table's
+           normalized keys and confidently reported the opposite of the truth.</p>
+        <p>The <code>BREAKGLASS</code> row is shown as a banner but is <b>read-only</b> here:
+           turning governance off should be a deliberate CLI act, not a button.</p>
+      </div>
+      <div class="note" style="margin-top:10px">
+        <b>Invariant, enforced at synth time.</b> The public surface is <b>API Gateway</b>, never the
+        Lambda itself. <code>pilot/guards.py</code> applies a CDK aspect that <em>fails the build</em>
+        on any Lambda with a wildcard invoke principal or a Function URL with
+        <code>authType=NONE</code>. "Authorize in code behind a public invoke endpoint" is not the
+        same as "not publicly invokable", and the aspect exists so that distinction cannot be lost by
+        accident. See <code>docs/FINDINGS.md</code> for the incident that prompted it.
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow" style="margin-top:14px">▼ &nbsp; both hops: SigV4, signed with the ONE gateway execution role &nbsp; ▼</div>
+
+  <!-- UPSTREAMS -->
+  <div class="note" style="margin:0 0 14px">
+    <b>What &ldquo;passthrough&rdquo; does and does not mean.</b> It is the name of a gateway
+    <em>target type</em>, not a statement about credentials. Both targets are configured
+    <code>credentialProviderType: GATEWAY_IAM_ROLE</code>, so <b>both</b> upstream calls are
+    SigV4-signed by the gateway execution role, and neither passes caller credentials through
+    &mdash; the caller only ever holds a Cognito bearer token. The difference is how the SigV4
+    <b>service name</b> is chosen: an <em>inference</em> target derives it from the endpoint
+    hostname, while a <em>passthrough</em> target is one of the few types allowed to state it
+    explicitly. Runtime needs that override, which is the entire reason it is a passthrough
+    target. What <em>is</em> passed through is the request <b>body and path</b>: passthrough does
+    no schema translation, so the model id stays in the URL rather than being routed from the body.
+  </div>
+
+  <div class="split">
+    <div class="up">
+      <h4>bedrock-mantle <span class="tag">inference target</span></h4>
+      <p>Unified serverless surface — 110+ models across ~12 providers. Deployed twice for
+         comparison: a zero-config <b>connector</b> and an explicit <b>provider</b>
+         configuration (the default serving path).</p>
+      <p>Addressed at <code>/inference/v1/messages</code>. Model ids like
+         <code>anthropic.claude-sonnet-5</code>.</p>
+      <p>Signing service is <b>derived from the hostname</b> —
+         <code>bedrock-mantle</code> — which happens to be correct, so no override is needed.</p>
+    </div>
+    <div class="up">
+      <h4>bedrock-runtime <span class="tag">HTTP passthrough</span></h4>
+      <p>Classic runtime API incl. cross-region inference profiles. <b>Cannot</b> be an
+         inference target: the gateway derives the SigV4 service from the endpoint hostname
+         (<code>bedrock-runtime</code>) but runtime signs as <code>bedrock</code>, and the
+         <code>IamCredentialProvider</code> override is rejected on inference targets.</p>
+      <p>Addressed at <code>/bedrockrt/model/&lt;modelId&gt;/invoke</code> — the inference
+         router does not see passthrough targets. Model ids like
+         <code>us.anthropic.claude-sonnet-5</code>.</p>
+      <p>Signing service is <b>explicitly set</b> to <code>bedrock</code> via
+         <code>IamCredentialProvider</code>. Signing the identical request by hand with that
+         service returns <code>200</code>, which isolated the defect to the service name.</p>
+    </div>
+  </div>
+
+  <!-- COVERAGE -->
+  <div class="band" style="margin-top:14px">
+    <div class="hdr">Verified coverage — same request, both surfaces</div>
+    <table>
+      <thead><tr><th>Control</th><th>mantle</th><th>runtime</th><th>Enforced by</th></tr></thead>
+      <tbody>
+        <tr><td>Group authorization</td><td class="ok">403</td><td class="ok">403</td><td>Cedar policy</td></tr>
+        <tr><td>Model entitlement</td><td class="ok">403</td><td class="ok">403</td><td>interceptor + config table</td></tr>
+        <tr><td>Guardrail (prompt injection)</td><td class="ok">403</td><td class="ok">403</td><td>interceptor → ApplyGuardrail</td></tr>
+        <tr><td>Rate limit (requests + tokens, poolable)</td><td class="ok">429</td><td class="ok">429</td><td>interceptor + <code>RATE#</code> counters</td></tr>
+        <tr><td>Cost budget (true spend)</td><td class="ok">429</td><td class="ok">429</td><td>interceptor + ledger</td></tr>
+        <tr><td>Unresolvable model (fail closed)</td><td class="ok">403</td><td class="ok">403</td><td>interceptor, CONTROL 0</td></tr>
+        <tr><td>Accountability (prompt, response, tools)</td><td class="ok">logged</td><td class="ok">logged</td><td>both interceptors → audit log</td></tr>
+        <tr><td>Governance unavailable (fail closed)</td><td class="ok">403</td><td class="ok">403</td><td>interceptor deadline + wrapper</td></tr>
+        <tr style="opacity:.55"><td><s><em>Native</em> token rate limit</s></td><td class="warn">429</td><td class="bad">never fires</td><td><s>native rate limit</s> — <b>removed</b></td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <b>The design in one table.</b> Every row that must hold on both surfaces is enforced by the
+      interceptor, because it is the only layer that sees every request regardless of target type or
+      API shape. The struck-through row is the one mechanism that could not meet that bar: a native
+      rate limit applies only on recognised inference paths and meters input tokens only, so it
+      enforced nothing on half the traffic while looking fully configured. It was removed rather than
+      kept as a partial backstop.
+    </div>
+  </div>
+
+  <!-- REQUEST NORMALIZATION -->
+  <div class="band">
+    <div class="hdr">How one interceptor governs every request shape</div>
+    <p style="margin:0 0 10px;color:var(--dim);font-size:12.5px">
+      The gateway is a single front door onto contracts that disagree with each other. Governance
+      cannot depend on which one the caller used, so the interceptor never reads the raw body
+      directly &mdash; it reads a normal form.</p>
+    <table>
+      <thead><tr><th>Path</th><th>Model comes from</th><th>Prompt lives in</th><th>Output ceiling</th></tr></thead>
+      <tbody>
+        <tr><td><code>/inference/v1/messages</code></td><td>body <code>model</code></td><td><code>messages[].content[]</code>, <code>system</code></td><td><code>max_tokens</code></td></tr>
+        <tr><td><code>/inference/v1/chat/completions</code></td><td>body <code>model</code></td><td><code>messages[].content</code></td><td><code>max_tokens</code></td></tr>
+        <tr><td><code>/inference/v1/responses</code></td><td>body <code>model</code></td><td><code>input</code>, <code>instructions</code></td><td><code>max_output_tokens</code></td></tr>
+        <tr><td><code>/bedrockrt/model/&lt;id&gt;/invoke</code></td><td><b>the URL</b></td><td>provider-specific body</td><td><code>max_tokens</code></td></tr>
+        <tr><td><code>/bedrockrt/model/&lt;id&gt;/converse</code></td><td><b>the URL</b></td><td><code>messages[].content[].text</code>, <code>system[]</code></td><td><code>inferenceConfig.maxTokens</code></td></tr>
+      </tbody>
+    </table>
+    <div class="note" style="margin-top:12px">
+      <b><code>_normalize(path, body)</code></b> reduces all of that to one contract every control
+      reads: <code>{model, model_source, api_shape, surface, verb, streaming, text_units,
+      max_output_tokens, tools}</code>. Three properties matter:
+      <br><br>
+      <b>Text is harvested by structure, not by field name.</b> A recursive walk over text-bearing
+      keys (<code>text</code>, <code>content</code>, <code>toolResult</code>, <code>toolUse</code>,
+      <code>input</code>, <code>arguments</code>, <code>json</code>, <code>parts</code>,
+      <code>guardContent</code>) collects prompt text wherever it sits &mdash; including inside tool
+      results, which is the text an agent feeds back to itself and therefore attacker-controlled.
+      Opaque keys (<code>bytes</code>, <code>source</code>, <code>s3Location</code>) terminate the
+      walk, so image base64 is never scanned.
+      <br><br>
+      <b>Path matching is generic in the verb.</b> <code>/model/([^/]+)/([A-Za-z0-9_-]+)</code>
+      rather than a fixed <code>/invoke</code>, so a runtime operation that does not exist yet still
+      resolves its model and still gets governed.
+      <br><br>
+      <b>An unresolvable model fails closed.</b> If the target model cannot be determined from
+      either the path or the body, the request is denied <code>403 model_unresolved</code> &mdash;
+      because entitlement and pricing are both unevaluable without it. The <code>api_shape</code>
+      label also carries a trailing <code>?</code> when it was inferred from the body rather than
+      recognised from the path, so an unaccounted-for shape is one audit query away.
+    </div>
+    <div class="note" style="margin-top:10px">
+      <b>Why it is built this way rather than as a set of per-shape readers:</b> three separate
+      governance bypasses came from per-shape field lookups, one of which left <code>Converse</code>
+      entirely ungoverned. The narrative, the measurements and the general lesson are in
+      <code>docs/FINDINGS.md</code>.
+    </div>
+  </div>
+
+  <!-- AUDIT -->
+  <div class="band">
+    <div class="hdr">The audit log — one place to answer "who asked what, and what did we do"</div>
+    <div class="row">
+      <div class="box">
+        <h4>Why not Bedrock invocation logging</h4>
+        <p>It is an account-level setting this stack does not own, mantle does not offer it, and it
+           records the Bedrock <em>call</em>. A guardrail denial never reaches Bedrock, so the most
+           security-relevant events would be missing entirely.</p>
+      </div>
+      <div class="box">
+        <h4>Why not the decision records</h4>
+        <p>They carry a <b>24-hour TTL</b> by design — they are operational state for the console,
+           not an archive. The audit log is retained 90 days, and the Statistics tab links into it
+           for anything older than its own window.</p>
+      </div>
+      <div class="box">
+        <h4>How it is wired</h4>
+        <p>Both interceptors set the Lambda <code>logGroup</code> property to the
+           <b>same</b> group. A structured <code>print</code> therefore lands in one destination —
+           no <code>PutLogEvents</code> plumbing, no log-stream lifecycle, and no 5 TPS-per-stream
+           throttling ceiling.</p>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>What a reviewer asks</th><th>Field</th><th>Stage</th></tr></thead>
+      <tbody>
+        <tr><td>Who asked?</td><td><code>username</code> · <code>sub</code> · <code>groups</code> · <code>client_id</code> · <code>source_ip</code></td><td>REQUEST</td></tr>
+        <tr><td>What did they ask?</td><td><code>prompt_sha256</code> · <code>prompt_chars</code> (· <code>prompt_text</code> if enabled)</td><td>REQUEST</td></tr>
+        <tr><td>Which tools were offered?</td><td><code>tool_specs</code> · <code>tool_invocations</code></td><td>REQUEST</td></tr>
+        <tr><td>What did we decide, and why?</td><td><code>decision</code> · <code>status</code> · <code>control</code> · <code>scope</code> · <code>fail_open</code>/<code>fail_closed</code> · <code>reason</code></td><td>REQUEST</td></tr>
+        <tr><td>Where was it going?</td><td><code>model</code> · <code>model_source</code> · <code>surface</code> · <code>api_shape</code> · <code>verb</code> · <code>streaming</code></td><td>REQUEST</td></tr>
+        <tr><td>What did the model reply?</td><td><code>response_sha256</code> · <code>response_chars</code> (· <code>response_text</code> if enabled)</td><td>RESPONSE</td></tr>
+        <tr><td>Which tools did it actually call?</td><td><code>response_tool_calls</code> · <code>stop_reason</code></td><td>RESPONSE</td></tr>
+        <tr><td>What did it cost?</td><td><code>input_tokens</code> · <code>output_tokens</code> · cache tokens · <code>cost_usd</code> · <code>accounted</code></td><td>RESPONSE</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <b>Content is hashed, not stored, by default.</b> Prompt and response text are reduced to a
+      SHA-256 plus a length — enough to correlate, to prove two calls were identical, and to detect
+      tampering, without concentrating sensitive content in CloudWatch.
+      <code>AUDIT_LOG_PROMPT_TEXT</code> and <code>AUDIT_LOG_RESPONSE_TEXT</code> turn the text on
+      deliberately, with a character cap and a <code>truncated</code> flag.
+    </div>
+    <div class="note" style="margin-top:10px">
+      <b>A data protection policy is on regardless</b> — 8 identifier types (email, credit card,
+      SSN, US phone, AWS secret key, IP address, address, name) masked <em>at ingest</em>, with an
+      Audit statement alongside the Deidentify statement so you can see what was found.
+      <br><br>
+      This is on even though content logging is off, because <b>content is not the only leak
+      path</b>: guardrail assessments quote the offending span, error strings quote request
+      fragments, and tool arguments carry whatever the caller put in them. A field you did not
+      intend to be sensitive is exactly the field that leaks.
+    </div>
+    <h4 style="margin:18px 0 4px;font-size:13px">Reading the <code>decision</code> field</h4>
+    <p style="margin:0 0 6px;color:var(--dim);font-size:12.5px">Decisions fall into four groups, and
+       a dashboard that treats them alike is misleading — a policy denial is normal traffic, a
+       fail-closed denial is an incident.</p>
+    <table>
+      <thead><tr><th>Group</th><th>Decisions</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td class="ok">Allowed</td><td><code>allowed</code> · <code>allowed_guardrail_off</code> · <code>allowed_no_prompt_text</code></td><td>dispatched; the second two are configured outcomes, not failures</td></tr>
+        <tr><td class="warn">Denied by policy</td><td><code>model_access_denied</code> · <code>guardrail_blocked</code> · <code>rate_limit_exceeded</code> · <code>cost_budget_exceeded</code></td><td>expected traffic meeting a rule</td></tr>
+        <tr><td class="bad">Fail closed</td><td><code>governance_timeout</code> · <code>governance_unavailable</code> · <code>governance_retry_indeterminate</code> · <code>model_unresolved</code> · <code>unrecognised_shape</code> · <code>unparseable_body</code></td><td><b>operational signal</b> — policy could not be established. Alarm on these.</td></tr>
+        <tr><td class="bad">Bypassed</td><td><code>breakglass_bypass</code></td><td><b>governance is off</b> right now, by administrator action</td></tr>
+      </tbody>
+    </table>
+    <div class="note" style="margin-top:12px">
+      <b>How a Cedar denial gets attributed:</b> the REQUEST interceptor runs <em>before</em> Cedar,
+      so its own record says <code>allowed</code> for a request Cedar then refuses. The RESPONSE
+      interceptor resolves this, because it is the only component that sees both the interceptor's
+      decision and the caller's actual status. It stamps <code>final_status</code> and
+      <code>final_layer</code> onto the decision record and the audit record, keyed off a signal
+      that needs no new field: a <code>PENDING#</code> row exists only on the allow path, so
+      <em>pending present + final ≥ 400</em> means a later layer refused, while
+      <em>no pending + final ≥ 400</em> means the interceptor itself did.
+      <br><br>
+      Two honest caveats. The gateway never <em>reports</em> a policy-engine decision to the
+      response interceptor, so <code>policy_engine</code> is deduced from "we allowed it and the
+      caller got a <code>403</code>" — sound because Cedar is the only post-interceptor layer here
+      returning <code>403</code>. And a denial's RESPONSE record carries no
+      <code>username</code>, since the response event has none; join on <code>request_id</code>.
+      <br><br>
+      Also relevant when querying: the RESPONSE interceptor <b>does</b> run after a REQUEST
+      short-circuit, contrary to the documentation for HTTP targets, so an interceptor denial
+      produces records at both stages.
+    </div>
+  </div>
+
+  <!-- OBSERVABILITY -->
+  <div class="band">
+    <div class="hdr">Observability — one authoritative source, and two supporting ones</div>
+    <div class="row">
+      <div class="box">
+        <h4>Interceptor decision records <span class="tag both">authoritative</span></h4>
+        <p>Every request, with user identity, model, decision, the resolved final outcome and true
+           cost. This is what the admin console reads and what every statistic is computed from.</p>
+      </div>
+      <div class="box">
+        <h4>Gateway OTEL spans → <code>aws/spans</code> <span class="tag mantle">diagnostics</span></h4>
+        <p>Reveals the real <code>qualifiedModelId</code>, and which <em>native</em> layer answered.
+           Deliberately <b>not</b> a governance statistic: interceptor short-circuits are not
+           spanned at all, spans carry no identity or token counts, and of the two outcomes they
+           distinguished, <code>errorType=throttle</code> is now impossible (both native rate
+           limits were deleted) and <code>errorType=user</code> (Cedar) is resolved from the
+           decision records instead. Available on request at
+           <code>/api/diagnostics/spans</code>.</p>
+      </div>
+      <div class="box">
+        <h4>Central audit log <span class="tag both">retained</span></h4>
+        <p>The same decisions as above, plus response-side tokens and true cost, in one CloudWatch
+           group with 90-day retention and field indexes. This is the copy a security reviewer
+           searches; the DynamoDB records are the copy the console reads.</p>
+      </div>
+    </div>
+    <div class="note">
+      <b>Why they are kept separate:</b> spans carry no identity and no token counts, and
+      <b>interceptor short-circuits are not spanned at all</b> — measured, 10 interceptor
+      decisions including 6 denials against spans showing a single 403. Blending them would
+      silently undercount every governance denial.
+    </div>
+  </div>
+
+  <!-- STREAMING -->
+  <div class="band">
+    <div class="hdr">The one configuration choice with a visible cost</div>
+    <table>
+      <thead><tr><th>Interception point</th><th>Streaming</th><th>Can enforce</th></tr></thead>
+      <tbody>
+        <tr><td>REQUEST only</td><td class="ok">preserved</td><td>model access, rate, guardrail, cost <em>reservation</em></td></tr>
+        <tr><td>+ RESPONSE</td><td class="bad">buffered</td><td>the above, plus <b>true</b> output-token cost and response-side audit</td></tr>
+      </tbody>
+    </table>
+    <div class="note" style="margin-top:12px">
+      A REQUEST interceptor completes before dispatch and never sits in the response path, so there
+      is nothing to buffer. A RESPONSE interceptor runs in <b>buffered mode only</b> for HTTP and
+      inference targets, and the buffering is <b>not tunable</b> — there is no chunk size or
+      threshold, only the presence or absence of the interceptor.
+      <br><br>
+      Measured on this stack: request-only interception delivers a <b>5.4s spread</b> of genuine
+      progressive streaming (248 SSE events, first token 2.7s). With output-token accounting
+      attached: same SSE format, same content, first token <b>7.4s</b> and a <b>0.0s spread</b> —
+      every chunk arrives together.
+      <br><br>
+      <b>This deployment enables output-token accounting</b>, so streaming is buffered here. Set
+      <code>ENABLE_OUTPUT_TOKEN_ACCOUNTING = False</code> in <code>pilot/config.py</code> to reverse
+      the choice and fall back to prompt-only cost. Nothing else changes.
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>Where to go next.</b>
+    <code>README.md</code> — what this is and how to deploy it ·
+    <code>walkthrough.ipynb</code> — 16 runnable sections, executed with outputs saved ·
+    <code>docs/DEPLOYMENT.md</code> — deploying into your own account ·
+    <code>docs/ADMIN-CONSOLE.md</code> — console internals and production gaps.
+    <br><br>
+    <b><code>docs/FINDINGS.md</code></b> is the companion to this page. This page describes how the
+    solution works; that one records <em>why it is built this way</em> — every mechanism that was
+    tried and failed, the exact errors that proved it, and the complete limitations list.
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Normalise line endings so the repo stores LF regardless of contributor OS.
+# Without this, cloning on Windows and committing back produces whole-file diffs.
+* text=auto eol=lf
+
+# PowerShell is the documented shell for this project; keep CRLF for those.
+*.ps1 text eol=crlf
+
+# Treat the executed notebook as text so diffs are reviewable, but do not let
+# Git try to merge it - notebook JSON does not merge sensibly.
+*.ipynb text eol=lf merge=binary
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.pdf binary

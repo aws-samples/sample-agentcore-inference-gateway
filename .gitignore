@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# CDK
+cdk.out/
+cdk.out.*/
+*.d.ts
+
+# Local deploy / verification transcripts. Real account ids and gateway ids end up in
+# these, and they are a record of one machine's run, not of the repo.
+deploy*.log
+*-verify*.log
+
+# Local env / secrets - never commit
+.env
+*.pem
+
+# Token caches (contain refresh tokens)
+*.msal_cache.bin
+*.token_cache.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Agent working context — not part of the published sample. Contains internal notes
+# and dev-account identifiers; kept local, excluded from the repo.
+.kiro/

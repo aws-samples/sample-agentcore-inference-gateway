@@ -2,9 +2,11 @@
 
 **Status: built and verified.** All required capabilities are delivered.
 
-The console is a single Lambda serving both a JSON API and a single-file SPA, behind an
-API Gateway HTTP API. Policy data lives in DynamoDB, so changes take effect at runtime
-with no deployment.
+The console is served by **one CloudFront distribution with two origins**: the single-file
+SPA is a static object in a **private S3 bucket** (origin-access-control only), and the JSON
+API is a Lambda behind an API Gateway HTTP API, routed at `/api/*` on the same distribution.
+Because the UI and the API answer on one origin there is no cross-origin request and **no
+CORS**. Policy data lives in DynamoDB, so changes take effect at runtime with no deployment.
 
 Four screens: **Model access**, **Rate & cost**, **Guardrails**, **Statistics**. Each one
 explains the control it configures in prose, because the policy primitives are not
@@ -23,7 +25,7 @@ Sign in as:     gwadmin  /  <AdminUserPassword stack output>   (demo only)
 | # | Required capability | Status | Where it is enforced |
 |---|---|---|---|
 | 1 | View and configure **model access** for users/groups | ✅ delivered | config table → interceptor |
-| 2 | View and configure **model cost limits** for users/groups | ✅ delivered | config table → interceptor + ledger |
+| 2 | View and configure **model cost limits** (daily + monthly) for users/groups | ✅ delivered | config table → interceptor + ledger |
 | 3 | View and configure **rate limits**, per user or pooled per group | ✅ delivered | config table → interceptor + `RATE#` counters |
 | 4 | **Enforce guardrails** for specific users/groups | ✅ delivered | config table → interceptor |
 | 5 | **View inference statistics** for all requests | ✅ delivered | interceptor decision records, outcome-resolved |
@@ -53,7 +55,7 @@ interceptor picks it up within the cache TTL, with no deployment.
 |---|---|---|
 | `MODELS` | `allow[]`, `deny[]` | glob lists matched against the model id; **deny wins** |
 | `RATELIMIT` | `tokens_per_window`, `requests_per_window`, `window_seconds`, `pooled` | tokens/requests per window; `pooled` decides whether the allowance is **shared across the scope** or granted per user |
-| `BUDGET` | `budget_usd`, `window_seconds` | spend cap per principal per window |
+| `BUDGET` | `daily_budget_usd`, `monthly_budget_usd` | independent daily + monthly spend caps per principal; **either can deny** (0/absent = that window not enforced). A legacy `budget_usd`/`window_seconds` row is still honoured as the daily cap. |
 | `GUARDRAIL` | `guardrail_id`, `guardrail_version`, `enabled` | which Bedrock guardrail applies, at which version, or none |
 
 Plus one row that is operational rather than policy, and lives only at the `DEFAULT` scope:
@@ -221,7 +223,10 @@ on an existing table — the console is the intended path.
 
 ```mermaid
 flowchart LR
-    ADMIN["Admin browser"] -->|"USER_PASSWORD_AUTH<br/>access token"| APIGW["API Gateway HTTP API<br/>no authorizer"]
+    ADMIN["Admin browser"] -->|"HTTPS"| CF["CloudFront<br/>one distribution"]
+    CF -->|"/ (default)"| S3[("private S3 bucket<br/>SPA, OAC only")]
+    CF -->|"/api/*"| APIGW["API Gateway HTTP API<br/>no authorizer"]
+    ADMIN -.->|"USER_PASSWORD_AUTH<br/>access token"| COG
     APIGW --> FN["Admin Lambda<br/>authz in code"]
     FN -->|"GetUser + AdminListGroupsForUser<br/>ListUsers + ListGroups (pickers)"| COG["Amazon Cognito"]
     FN <-->|"read / write policy"| CFG[("governance-config")]
@@ -281,6 +286,14 @@ A synth-time CDK Aspect (`pilot/guards.py`) fails the build if any Lambda in the
 wildcard principal or an unauthenticated Function URL, so this cannot regress. Verified: a
 deliberately-bad stack fails `cdk synth` with exit 1. (Error annotations are enforced by the
 CDK CLI — a bare `python app.py` collects them without raising.)
+
+The public surface is now **CloudFront**, with the API Gateway HTTP API as its `/api/*`
+origin and the private S3 bucket as its default origin. That keeps the invariant intact —
+the Lambda is still never the public surface — and it is what allowed CORS to be removed and
+WAF to become attachable (see *Delivery: CloudFront + private S3* below). A CloudFront
+distribution in front of a Lambda **Function URL** would reintroduce the `authType=NONE`
+problem the aspect exists to catch, which is why the API origin is the HTTP API, not a
+Function URL.
 
 ### Authorization, and its honest caveat
 
@@ -557,16 +570,15 @@ The console is a working demonstration, not a hardened product.
 - **Login uses `USER_PASSWORD_AUTH` directly from the browser.** Convenient and
   self-contained; a production console should use the Cognito hosted UI with
   authorization-code + PKCE.
-- **No CloudFront or WAF.** The API Gateway endpoint is public; only the SPA shell is
-  readable without an admin token, but rate limiting and edge protection are absent.
-  Tracked as a **deferred action item** at the end of this document, with the target
-  architecture written out.
+- **No WAF attached.** The console is behind CloudFront (see *Delivery: CloudFront + private
+  S3* below), which makes a WAF web ACL attachable via the distribution's `web_acl_id` with no
+  other change — but none is attached here. Edge rate-limiting and managed rule groups are
+  therefore not in place; that is the remaining edge-protection gap.
 - **The admin mutation trail is CloudWatch log lines**, not a queryable append-only store,
   and it is in the admin function's own log group rather than the central audit log. The
   *enforcement* trail is better off — see above — but administrative changes are not yet
   part of it.
 - **No optimistic concurrency.** Two admins editing the same row will last-write-wins.
-- **CORS is `*`.** Fine for a demo; pin it to the console origin otherwise.
 - **Demo credentials are throwaway.** The `gwadmin` password is generated at deploy time (or
   set via `ACGW_ADMIN_PASSWORD`) and surfaced as the `AdminUserPassword` stack output — not
   hardcoded. A real console would use the Cognito hosted UI with a forced password reset.
@@ -593,11 +605,17 @@ The console is a working demonstration, not a hardened product.
 - **Send admin mutations to the central audit log.** One line —
   `log_group=self._audit_log_group` on the admin console function — would put "who changed
   the policy" alongside "what did we enforce", with 90-day retention instead of the default.
-- **Point the Statistics tab at the audit log** so it is not limited to the 24-hour decision
-  TTL, and so the window is bounded by the archive rather than by what a DynamoDB scan can
-  affordably retain. The data is already there for 90 days with field indexes on `request_id`,
-  `username`, `decision` and `model`. Today the console links out to Logs Insights instead,
-  which answers the question but in a second place.
+- ~~**Per-user cost history beyond the 24-hour decision window.**~~ **Delivered** via an
+  out-of-band rollup (see *Cost history and the rollup* below). The per-request Statistics
+  table is still bounded by the decision-record TTL — reading that raw history from the audit
+  log remains open — but per-user **daily and monthly cost** now come from durable aggregates,
+  so the "what did this user spend this month" question is answered without keeping raw rows.
+- ~~**Live model catalog in the pickers.**~~ **Delivered.** The rule builder and the
+  effective-access probe are populated from `/api/catalog`, which polls the live Bedrock
+  foundation-model and inference-profile catalogs on both surfaces, so an admin builds policy
+  against model ids that actually exist rather than typing them.
+- ~~**Daily + monthly cost budgets.**~~ **Delivered.** The `BUDGET` kind carries independent
+  `daily_budget_usd` and `monthly_budget_usd` caps; either can deny.
 - ~~**Separate the fail-closed decisions from the policy denials.**~~ **Delivered.** Denials
   are attributed to the layer that produced them, and the decision vocabulary above groups
   policy denials, fail-closed denials and bypass separately.
@@ -610,34 +628,100 @@ The console is a working demonstration, not a hardened product.
   the scope that matched, not as a shared pool). The `RATELIMIT` kind already supports
   `pooled`; `BUDGET` does not yet. Same fix: key the spend counter on the matched scope
   rather than on `sub`.
+- **Raw per-request history beyond 24 hours.** The rollup covers per-user daily/monthly
+  *cost*, but the per-request Statistics table still reads the 24-hour decision records. Reading
+  the full per-request history from the 90-day audit log is still open.
 
 ---
 
-## Deferred action item — put the whole console behind CloudFront + S3
+## Cost history and the rollup
 
-**Status: deferred deliberately, not overlooked.** The console keeps its current
-architecture (single Lambda serving both the SPA and the JSON API, behind an API Gateway
-HTTP API) until the planned admin UI changes are finished. Rebuilding the delivery path
-first would mean doing it twice.
+The per-request `DECISION#` records the Statistics table reads expire after 24 hours — the
+right horizon for a cheap, fast operational view, but too short to answer *"what did this user
+spend this month"*. That question is answered by a separate, **out-of-band rollup**.
 
-**The target architecture**, once the UI work is done:
+**Why out of band.** The two interceptors are on the request/response hot path and must stay
+lean and fail closed — a request-interceptor timeout makes the gateway fail *open*, so any
+non-essential work there is a liability. Aggregating cost history is non-essential to
+enforcement, so it must not live in the interceptors. Instead a scheduled Lambda
+(`acgw-pilot-cost-rollup`, EventBridge every 15 min) reads the ledger's decision records and
+writes durable per-user **daily** and **monthly** cost aggregates to a separate table
+(`acgw-pilot-cost-rollup`) with a long TTL. The interceptors are untouched.
 
-| Today | Target |
+The rollup also harvests the `sub -> username` pairing off-path (decision records carry both),
+so the live spend counters — which are keyed on the Cognito `sub` because that is all the
+interceptor has cheaply — can be shown with **usernames** instead of UUIDs.
+
+The console reads these aggregates from `/api/costs?period=daily|monthly`, which is what backs
+the **Cost history** card on the Statistics tab. Because the aggregates outlive the raw
+records, the cost view can look back weeks while the interceptors stay on their 24-hour
+operational copy.
+
+### Live counters vs Cost history — two views, deliberately
+
+The console shows cost in two places that measure different things, and an operator
+comparing them should know what to expect:
+
+| | **Live counters** (Rate & cost tab) | **Cost history** (Statistics tab) |
+|---|---|---|
+| Source | the ledger's `<sub>#D#…` / `<sub>#M#…` spend counters | the rollup table's per-user `D#` / `M#` aggregates |
+| What it is | the number the budget cap is **enforced against**: reserved at request time, corrected to true cost on response, refunded on failure | the sum of `cost_usd` over the decision records the rollup could see |
+| Freshness | immediate (it *is* the enforcement state) | up to 15 min behind (schedule), or on demand by invoking the rollup |
+| Lifetime | 3 days (daily) / 40 days (monthly) | ~400 days |
+| Requests column | — | counts **every** decision, denials included, so it reads higher than the number of priced requests |
+
+For the same UTC day with no requests in flight the two figures agree to the cent — measured
+on the live deployment as `$0.001454` on both sides for each demo user after a burst of 15
+requests. They diverge only when the enforcement counters have been reset by hand (they were,
+once, while migrating from the single-window to the dual calendar counters) — the rollup keeps
+the history, the counters restart from zero.
+
+The **rate** rows in Live counters are the counters for the **current rate window only**
+(`RATE#<subject>#<epoch // window>`). The interceptor gives each row a three-window grace `ttl`
+so a request straddling a boundary still finds it, and DynamoDB reaps expired rows lazily, so a
+raw scan returns closed buckets for minutes to hours. The console therefore keeps only the
+bucket equal to `now // w` for each configured window — with a 60-second window a row appears
+while traffic is flowing and is gone a minute later, which is the correct reading of a rate
+counter. Per-user rate rows are shown as `USER#<username>` (the raw `sub` is the hover title),
+resolved through the same `sub -> username` map the spend rows use.
+
+---
+
+## Delivery: CloudFront + private S3
+
+**Status: delivered.** The console is served by **one CloudFront distribution with two
+origins**, path-routed. This replaced the earlier design where a single Lambda served both
+the SPA HTML and the JSON API.
+
+| Before | Now |
 |---|---|
-| SPA HTML returned by the Lambda | SPA on a **private S3 bucket**, origin-access-control only |
-| API Gateway HTTP API, public | Same API as a second **CloudFront origin** (`/api/*` behaviour) |
-| `CORS: *` | No CORS at all — SPA and API share one origin |
-| No edge protection | **WAF** attachable to the distribution; managed rules + rate-based rule |
-| Lambda does content negotiation | Lambda serves **only** JSON |
+| SPA HTML returned by the Lambda | SPA is a static object in a **private S3 bucket**, reachable only via CloudFront (Origin Access Control) |
+| API Gateway HTTP API, public | Same API as the `/api/*` **CloudFront origin** on the same distribution |
+| `CORS: *` (Lambda headers + HTTP API preflight) | **No CORS at all** — SPA and API share one origin |
+| No edge protection | **WAF attachable** via the distribution's `web_acl_id` (none attached here) |
+| Lambda did content negotiation (`/` vs `/api/*`) | Lambda serves **only** JSON; anything not `/api/*` is `404` |
 
-**Why it is worth doing.** Three of the production gaps listed above collapse into this one
-change: the `CORS: *` gap disappears because there is no cross-origin request left; WAF
-becomes attachable, which is the only place an unauthenticated flood can be stopped before
-it reaches the authorizer; and the SPA stops being served by a function that also holds
-DynamoDB write permissions.
+**Routing.** The distribution's default behaviour serves the SPA from S3
+(`GET/HEAD/OPTIONS`, cached). The `/api/*` behaviour targets the API Gateway origin with
+caching disabled and the `ALL_VIEWER_EXCEPT_HOST_HEADER` origin-request policy, so the
+caller's `Authorization` header reaches the Lambda while CloudFront still presents the API
+Gateway's own host. `AdminConsoleUrl` is the CloudFront domain.
 
-**What must not change with it.** The invariant enforced by `pilot/guards.py` still applies:
-the public surface is CloudFront or API Gateway, **never the Lambda itself**. A CloudFront
-distribution in front of a Lambda **Function URL** would reintroduce exactly the
-`authType=NONE` problem that aspect exists to catch — the origin must be the API Gateway
-endpoint, or a Function URL with `AWS_IAM` plus OAC signing.
+**What this bought.** Three gaps collapsed into one change: the `CORS: *` gap disappeared
+because there is no cross-origin request left; WAF became attachable, which is the only place
+an unauthenticated flood can be stopped before it reaches the authorizer; and the SPA stopped
+being served by a function that also holds DynamoDB write permissions.
+
+**The invariant held.** `pilot/guards.py` still applies: the public surface is CloudFront,
+**never the Lambda itself**. The API origin is the HTTP API, not a Lambda Function URL — a
+Function URL would reintroduce the `authType=NONE` problem that aspect exists to catch.
+
+**The SPA is origin-agnostic.** With no server-side render step, the static page reads region
+and Cognito client id from the unauthenticated `GET /api/meta` on load, then does its
+`USER_PASSWORD_AUTH` call to Cognito directly. Everything else is a same-origin `fetch("/api"
++ path)`.
+
+Verified end to end after deploy: SPA loads via the CloudFront domain; `/api/meta` and an
+authorized `/api/config` both route through `/api/*` to the Lambda (proving the `Authorization`
+header is forwarded); direct S3 object access returns `403`; and the API Gateway endpoint
+returns `404` for `/` (the Lambda no longer serves the UI).

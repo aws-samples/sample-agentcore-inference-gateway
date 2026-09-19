@@ -818,7 +818,12 @@ def _reconcile(request_id: str, usage: dict, resp_model: str) -> dict:
 
     sub = item.get("sub", {}).get("S", "")
     model = item.get("model", {}).get("S", "") or resp_model
-    bucket = item.get("bucket", {}).get("N", "0")
+    # Dual daily+monthly counters. Legacy pending rows (pre-migration) may still carry a
+    # single `bucket`/window key instead; fall back to it so in-flight requests across a
+    # deploy still reconcile.
+    day_pk = item.get("day_pk", {}).get("S", "")
+    month_pk = item.get("month_pk", {}).get("S", "")
+    legacy_bucket = item.get("bucket", {}).get("N", "")
     est = float(item.get("est_cost", {}).get("N", "0"))
     decision_pk = item.get("decision_pk", {}).get("S", "")
     username = item.get("username", {}).get("S", "?")
@@ -834,15 +839,25 @@ def _reconcile(request_id: str, usage: dict, resp_model: str) -> dict:
     true_cost = priced["cost_usd"]
     delta = true_cost - est
 
+    # Apply the reconciliation DELTA to both counters the reservation touched (an
+    # adjustment, not a second charge). A legacy single-bucket pending row updates the one
+    # counter it has.
+    targets = [pk for pk in (day_pk, month_pk) if pk]
+    if not targets and legacy_bucket:
+        targets = [f"{sub}#{legacy_bucket}"]
+    total = 0.0
     try:
-        resp = _ddb.update_item(
-            TableName=_COST_TABLE,
-            Key={"pk": {"S": f"{sub}#{bucket}"}},
-            UpdateExpression="ADD spend :d",
-            ExpressionAttributeValues={":d": {"N": str(delta)}},
-            ReturnValues="UPDATED_NEW",
-        )
-        total = float(resp["Attributes"]["spend"]["N"])
+        for i, pk in enumerate(targets):
+            resp = _ddb.update_item(
+                TableName=_COST_TABLE,
+                Key={"pk": {"S": pk}},
+                UpdateExpression="ADD spend :d",
+                ExpressionAttributeValues={":d": {"N": str(delta)}},
+                ReturnValues="UPDATED_NEW",
+            )
+            # Report the DAILY counter's new total (first target) as the window_total.
+            if i == 0:
+                total = float(resp["Attributes"]["spend"]["N"])
     except Exception as exc:  # noqa: BLE001
         print(f"reconcile failed ({exc})")
         return {"attributed": False, "reason": f"ledger update failed: {str(exc)[:200]}"}
@@ -930,18 +945,24 @@ def _settle_reservation(request_id: str, refund: bool) -> dict:
         if not item:
             return out
         sub = item.get("sub", {}).get("S", "")
-        bucket = item.get("bucket", {}).get("N", "0")
+        day_pk = item.get("day_pk", {}).get("S", "")
+        month_pk = item.get("month_pk", {}).get("S", "")
+        legacy_bucket = item.get("bucket", {}).get("N", "")
         est = float(item.get("est_cost", {}).get("N", "0"))
-        if refund and sub and est:
-            _ddb.update_item(
-                TableName=_COST_TABLE,
-                Key={"pk": {"S": f"{sub}#{bucket}"}},
-                UpdateExpression="ADD spend :d",
-                ExpressionAttributeValues={":d": {"N": str(-est)}},
-            )
+        targets = [pk for pk in (day_pk, month_pk) if pk]
+        if not targets and sub and legacy_bucket:
+            targets = [f"{sub}#{legacy_bucket}"]
+        if refund and est and targets:
+            for pk in targets:
+                _ddb.update_item(
+                    TableName=_COST_TABLE,
+                    Key={"pk": {"S": pk}},
+                    UpdateExpression="ADD spend :d",
+                    ExpressionAttributeValues={":d": {"N": str(-est)}},
+                )
             # Say REFUNDED, not "released". The old wording is what made the wrong branch
             # look correct in the logs for as long as it did.
-            print(f"REFUNDED reservation of {est:.6f} to {sub[:8]} "
+            print(f"REFUNDED reservation of {est:.6f} to {sub[:8]} (day+month) "
                   f"(request failed; no output produced)")
             out["refunded"] = True
         elif not refund:

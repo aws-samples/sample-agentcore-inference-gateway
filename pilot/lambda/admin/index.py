@@ -80,6 +80,11 @@ _PRICING_TABLE = os.environ.get("PRICING_TABLE", "")
 # strings a MODELS glob is actually matched against — see _model_inventory() for why
 # that is not the same as the pricing table's normalized keys.
 _GOVERNED_MODEL_IDS = os.environ.get("GOVERNED_MODEL_IDS", "")
+# Per-user daily/monthly cost aggregates + the sub->username map, written out-of-band by
+# the cost-rollup Lambda (never by the interceptors).
+_ROLLUP_TABLE = os.environ.get("COST_ROLLUP_TABLE", "")
+# The gateway's own URL, used to poll the live mantle model catalog for the pickers.
+_GATEWAY_URL = os.environ.get("GATEWAY_URL", "")
 
 _ddb = boto3.client("dynamodb", region_name=_REGION)
 _idp = boto3.client("cognito-idp", region_name=_REGION)
@@ -174,8 +179,11 @@ def _put_config(body: dict) -> dict:
         # which is a reasonable default but not something to leave implicit from a UI.
         item["pooled"] = {"BOOL": bool(body.get("pooled", False))}
     elif sk == "BUDGET":
-        item["budget_usd"] = {"N": str(float(body.get("budget_usd", 0)))}
-        item["window_seconds"] = {"N": str(int(body.get("window_seconds", 60)))}
+        # Independent daily + monthly caps; EITHER can deny. 0/absent means that window
+        # is not enforced, so a scope may set one, the other, both, or neither.
+        item["daily_budget_usd"] = {"N": str(float(body.get("daily_budget_usd", 0) or 0))}
+        item["monthly_budget_usd"] = {
+            "N": str(float(body.get("monthly_budget_usd", 0) or 0))}
     elif sk == "GUARDRAIL":
         item["guardrail_id"] = {"S": str(body.get("guardrail_id", ""))}
         # The version is part of the SELECTION, not an incidental detail. One id serves a
@@ -221,40 +229,146 @@ def _ledger_scan() -> list:
     return items
 
 
-def _spend(items: list) -> list:
-    """Per-user spend rows (pk = '<sub>#<window>').
+def _submap_from_ledger(items: list) -> dict:
+    """Build a sub -> username map from the ledger rows we already scanned.
 
-    The ledger table is shared by four record kinds, so this must skip the other three
+    DECISION# and PENDING# rows carry BOTH `sub` and `username`, so the mapping is free
+    here — no extra call. This is what lets the spend counters (keyed by sub, because
+    that is all the interceptor has cheaply on the hot path) be shown with real names.
+    The out-of-band rollup writes the same mapping to a durable SUBMAP row for names that
+    have aged out of the ledger; this in-scan map covers the live window.
+    """
+    m = {}
+    for it in items:
+        pk = it.get("pk", {}).get("S", "")
+        if pk.startswith(("DECISION#", "PENDING#")):
+            sub = it.get("sub", {}).get("S", "")
+            user = it.get("username", {}).get("S", "")
+            if sub and user and user != "?":
+                m[sub] = user
+    return m
+
+
+def _rollup_submap() -> dict:
+    """Durable sub -> username map from the rollup table (SUBMAP rows).
+
+    Covers names whose live ledger rows have aged out. Best-effort; the in-scan map is
+    the primary source for the current window.
+    """
+    if not _ROLLUP_TABLE:
+        return {}
+    m = {}
+    try:
+        resp = _ddb.query(
+            TableName=_ROLLUP_TABLE,
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": {"S": "SUBMAP"}},
+        )
+        for it in resp.get("Items", []):
+            sub = it.get("sk", {}).get("S", "")
+            user = it.get("username", {}).get("S", "")
+            if sub and user:
+                m[sub] = user
+    except Exception as exc:  # noqa: BLE001
+        print(f"rollup submap query failed ({exc})")
+    return m
+
+
+def _resolve_submap(items: list) -> dict:
+    """sub -> username for the live views: in-scan pairing first, durable rollup map
+    for anything the 24h ledger no longer carries. Shared by the spend AND rate counters
+    so the two tables name the same person the same way."""
+    submap = _submap_from_ledger(items)
+    if not submap:
+        submap = _rollup_submap()
+    return submap
+
+
+def _window_label(window: str) -> str:
+    """Turn a raw counter suffix into something readable.
+
+    Calendar counters are `D#YYYYMMDD` / `M#YYYYMM`; legacy fixed-window counters are a
+    bare epoch//window integer. Render the calendar ones as dates and leave a legacy
+    bucket as-is so old rows are still legible during a migration.
+    """
+    if window.startswith("D#") and len(window) == 10:
+        d = window[2:]
+        return f"day {d[0:4]}-{d[4:6]}-{d[6:8]}"
+    if window.startswith("M#") and len(window) == 8:
+        m = window[2:]
+        return f"month {m[0:4]}-{m[4:6]}"
+    return window
+
+
+def _spend(items: list, submap: dict | None = None) -> list:
+    """Per-user spend counter rows, shown with USERNAMES not raw subs.
+
+    The ledger table is shared by several record kinds, so this skips the others
     explicitly rather than assume anything without a known prefix is a spend counter:
       DECISION#  per-request governance decisions
       PENDING#   request-side reservations awaiting reconciliation
-      RATE#      rate-limit counters (added when rate limiting moved into the
-                 interceptor) — these carry `tokens`/`requests`, not `spend`, and
-                 counting them as spend rows produced phantom $0 users.
+      RATE#      rate-limit counters (carry tokens/requests, not spend)
+      SEEN#      idempotency markers
+
+    Counter keys are now calendar-aligned: `<sub>#D#YYYYMMDD` (daily) and
+    `<sub>#M#YYYYMM` (monthly). The sub is joined to a username so the console shows a
+    name instead of a UUID (#6).
     """
     skip = ("DECISION#", "PENDING#", "RATE#", "SEEN#")
+    submap = submap if submap is not None else _resolve_submap(items)
     rows = []
     for it in items:
         pk = it.get("pk", {}).get("S", "")
         if pk.startswith(skip):
             continue
-        sub, _, window = pk.partition("#")
+        # Calendar keys contain two '#': `<sub>#D#YYYYMMDD`. Split off the LAST two
+        # segments as the window so the sub (which never contains '#') is intact.
+        parts = pk.split("#")
+        if len(parts) >= 3 and parts[-2] in ("D", "M"):
+            sub = "#".join(parts[:-2])
+            window = f"{parts[-2]}#{parts[-1]}"
+        else:
+            sub, _, window = pk.partition("#")
         rows.append({
             "sub": sub,
+            "username": submap.get(sub, ""),
             "window": window,
+            "window_label": _window_label(window),
             "spend_usd": float(it.get("spend", {}).get("N", 0)),
         })
     rows.sort(key=lambda r: r["window"], reverse=True)
     return rows[:100]
 
 
-def _rate_counters(items: list) -> list:
+def _rate_counters(items: list, submap: dict | None = None,
+                   cfg: list | None = None) -> list:
     """Live rate-limit counters, so the console can show pooled vs per-user allowances.
 
     `RATE#GROUP#<g>#<bucket>` is a POOLED counter shared by the group;
     `RATE#USER#<sub>#<bucket>` is one person's. Showing both side by side is the only
-    way an admin can see that pooling is actually in effect.
+    way an admin can see that pooling is actually in effect. Per-user subjects are keyed
+    by Cognito sub on the hot path; they are shown as `USER#<username>` here, resolved
+    through the same map the spend rows use (#6), with the raw sub kept alongside.
+
+    Only the CURRENT window is "live". The interceptor keys each counter by
+    `bucket = epoch // window_seconds` and gives the row a grace-period `ttl` (three
+    windows) so a request straddling a boundary still finds its row, and DynamoDB reaps
+    TTL'd rows lazily anyway, so a plain scan returns closed buckets for minutes to hours.
+    A bucket is current iff it equals `now // w` for one of the configured windows; the
+    bucket numbers for different window sizes are orders of magnitude apart, so the check
+    is unambiguous without knowing which RATELIMIT row governs a given subject.
     """
+    submap = submap if submap is not None else _resolve_submap(items)
+    now = int(time.time())
+    # `cfg` is the PLAIN form from _list_config() (strings/numbers), not typed DynamoDB.
+    windows = {60}
+    for row in cfg or []:
+        if row.get("sk") == "RATELIMIT":
+            try:
+                windows.add(max(1, int(float(row.get("window_seconds", 60) or 60))))
+            except (TypeError, ValueError):
+                pass
+    live_buckets = {str(now // w) for w in windows}
     rows = []
     for it in items:
         pk = it.get("pk", {}).get("S", "")
@@ -262,8 +376,14 @@ def _rate_counters(items: list) -> list:
             continue
         rest = pk[len("RATE#"):]
         subject, _, bucket = rest.rpartition("#")
+        if bucket not in live_buckets:
+            continue
+        username = ""
+        if subject.startswith("USER#"):
+            username = submap.get(subject[len("USER#"):], "")
         rows.append({
-            "subject": subject,
+            "subject": f"USER#{username}" if username else subject,
+            "subject_key": subject,
             "pooled": subject.startswith("GROUP#"),
             "bucket": bucket,
             "tokens": int(float(it.get("tokens", {}).get("N", 0))),
@@ -497,6 +617,173 @@ def _model_inventory(ledger_items: list | None = None) -> dict:
     return out
 
 
+def _mantle_models() -> list:
+    """The REAL live catalog of the bedrock-mantle inference surface.
+
+    Mantle is a Bedrock service endpoint (`bedrock-mantle.<region>.api.aws`) that serves an
+    OpenAI-style `GET /v1/models`. It is NOT the same set as `ListFoundationModels`: the
+    runtime control-plane catalog is much wider (image, video and embedding models such as
+    Nova Canvas/Reel/embeddings) and most of it is never served on mantle, while mantle
+    carries providers the runtime catalog does not expose the same way (openai gpt-oss,
+    qwen, zai, nvidia, deepseek, google gemma, ...). Substituting one for the other put
+    models in the picker that do not exist on the mantle endpoint.
+
+    The gateway reaches mantle through its inference-provider target, which signs the call
+    with the gateway execution role as service `bedrock`. This Lambda does the same thing
+    directly with its own credentials — a SigV4-signed GET, no user JWT involved — which is
+    how it lists exactly what the endpoint will actually serve.
+    """
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    import urllib.request
+
+    host = f"bedrock-mantle.{_REGION}.api.aws"
+    url = f"https://{host}/v1/models"
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    req = AWSRequest(method="GET", url=url, headers={"host": host})
+    # Mantle signs as service "bedrock" (verified live: "bedrock-mantle" is rejected).
+    SigV4Auth(creds, "bedrock", _REGION).add_auth(req)
+    r = urllib.request.Request(url, headers=dict(req.headers), method="GET")
+    with urllib.request.urlopen(r, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    items = data.get("data") if isinstance(data, dict) else data
+    ids = []
+    for m in items or []:
+        mid = (m.get("id") or m.get("modelId")) if isinstance(m, dict) else None
+        if mid:
+            ids.append(mid)
+    return sorted(set(ids))
+
+
+def _catalog(ledger_items: list | None = None) -> dict:
+    """LIVE foundation-model catalog for the pickers, from BOTH Bedrock surfaces.
+
+    The point of this route is that an admin should build policy against model ids that
+    ACTUALLY EXIST on the deployment's Bedrock endpoints, rather than typing a string that
+    silently never matches. So it polls the real catalog of EACH endpoint:
+
+      * mantle   — `GET https://bedrock-mantle.<region>.api.aws/v1/models`, SigV4-signed as
+        service `bedrock` (see `_mantle_models`). This is the genuine list the mantle
+        inference surface serves, and it is deliberately NOT derived from
+        `ListFoundationModels`, which is a different, much wider catalog.
+      * runtime  — `bedrock:ListInferenceProfiles` gives the cross-region profile ids the
+        runtime passthrough actually addresses (`us.anthropic.claude-sonnet-5`, ...), with
+        `bedrock:ListFoundationModels` base ids as the fallback if profiles are unavailable.
+
+    Merged with the deployment's `configured` ids and the ids `observed` in real traffic,
+    then returned grouped so the UI can label where each id is reachable. Every list is a
+    real, current id a `MODELS` glob will actually be matched against.
+
+    Fail SOFT: a catalog call that errors returns what it has plus an `errors` note; the
+    picker degrades to configured+observed rather than breaking the page.
+    """
+    out = {"runtime": [], "mantle": [], "configured": [], "observed": [],
+           "all": [], "errors": []}
+
+    inv = _model_inventory(ledger_items)
+    out["configured"] = inv.get("configured", [])
+    out["observed"] = inv.get("observed", [])
+
+    # ---- mantle: the real inference-surface catalog ------------------------
+    try:
+        out["mantle"] = _mantle_models()
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(f"mantle /v1/models: {str(exc)[:160]}")
+
+    # ---- runtime: cross-region inference profiles (the us.* ids) -----------
+    runtime_ids = set()
+    try:
+        paginator = _bedrock.get_paginator("list_inference_profiles")
+        for page in paginator.paginate():
+            for p in page.get("inferenceProfileSummaries", []):
+                pid = p.get("inferenceProfileId", "")
+                if pid:
+                    runtime_ids.add(pid)
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(f"list_inference_profiles: {str(exc)[:160]}")
+
+    # Fallback for accounts with no inference profiles: the base foundation-model ids.
+    if not runtime_ids:
+        try:
+            resp = _bedrock.list_foundation_models()
+            for m in resp.get("modelSummaries", []):
+                mid = m.get("modelId", "")
+                if mid:
+                    runtime_ids.add(mid)
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"list_foundation_models: {str(exc)[:160]}")
+    out["runtime"] = sorted(runtime_ids)
+
+    out["all"] = sorted(set(out["runtime"]) | set(out["mantle"])
+                        | set(out["configured"]) | set(out["observed"]))
+    return out
+
+
+def _costs(period: str = "daily", limit_periods: int = 31) -> dict:
+    """Per-user cost aggregates from the OUT-OF-BAND rollup table.
+
+    This is the answer to "show me cost going back further than 24 hours" (#7). The
+    `DECISION#` records the live Statistics tab reads expire after 24h; the rollup Lambda
+    folds them into durable per-user daily/monthly totals BEFORE they expire, so this
+    route can look back weeks without keeping raw per-request rows around, and without
+    adding any work to the interceptors.
+
+    `period` is 'daily' or 'monthly'. Returns rows [{username, period, cost_usd,
+    requests}] plus per-user totals over the returned span, newest period first.
+    """
+    prefix = "M#" if period == "monthly" else "D#"
+    out = {"period": period, "rows": [], "by_user": {}, "periods": [],
+           "source": "cost-rollup", "error": None}
+    if not _ROLLUP_TABLE:
+        out["error"] = "rollup table not configured"
+        return out
+
+    items = []
+    try:
+        # USER# aggregate rows are spread across many partitions, so scan and filter by
+        # the sort-key prefix. The rollup table is small (one row per user per period).
+        kwargs = {"TableName": _ROLLUP_TABLE}
+        while True:
+            page = _ddb.scan(**kwargs)
+            items.extend(page.get("Items", []))
+            if "LastEvaluatedKey" not in page:
+                break
+            kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"rollup scan failed: {str(exc)[:200]}"
+        return out
+
+    periods = set()
+    for it in items:
+        pk = it.get("pk", {}).get("S", "")
+        sk = it.get("sk", {}).get("S", "")
+        if not pk.startswith("USER#") or not sk.startswith(prefix):
+            continue
+        username = pk[len("USER#"):]
+        period_key = sk[len(prefix):]
+        cost = float(it.get("cost_usd", {}).get("N", 0) or 0)
+        reqs = int(float(it.get("requests", {}).get("N", 0) or 0))
+        periods.add(period_key)
+        out["rows"].append({
+            "username": username,
+            "period": period_key,
+            "period_label": _window_label(sk),
+            "cost_usd": round(cost, 6),
+            "requests": reqs,
+        })
+        u = out["by_user"].setdefault(username, {"cost_usd": 0.0, "requests": 0})
+        u["cost_usd"] = round(u["cost_usd"] + cost, 6)
+        u["requests"] += reqs
+
+    # Keep only the most recent `limit_periods` periods, newest first.
+    keep = sorted(periods, reverse=True)[:max(1, limit_periods)]
+    keep_set = set(keep)
+    out["rows"] = [r for r in out["rows"] if r["period"] in keep_set]
+    out["rows"].sort(key=lambda r: (r["period"], r["username"]), reverse=True)
+    out["periods"] = keep
+    return out
+
+
 def _retention() -> dict:
     """The console's history horizon, and where to go for anything older.
 
@@ -524,6 +811,9 @@ def _retention() -> dict:
         "audit_console_url": "",
         "audit_insights_url": "",
         "audit_query": "",
+        # The out-of-band rollup gives durable per-user daily/monthly cost beyond the
+        # 24h decision window, so the UI can offer longer cost ranges from /api/costs.
+        "cost_rollup_available": bool(_ROLLUP_TABLE),
     }
     if not _AUDIT_LOG_GROUP:
         return out
@@ -847,14 +1137,15 @@ fields `attributes.http.response.status_code` as status,
 # http plumbing
 # --------------------------------------------------------------------------- #
 def _json(status: int, payload) -> dict:
+    # No CORS headers: the SPA (S3/CloudFront) and this API are served from the SAME
+    # CloudFront origin, so every /api/* call is same-origin. There is no cross-origin
+    # request to permit, and the previous `Access-Control-Allow-Origin: *` was a gap
+    # rather than a requirement.
     return {
         "statusCode": status,
         "headers": {
             "Content-Type": "application/json",
             "Cache-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Authorization,Content-Type",
-            "Access-Control-Allow-Methods": "GET,PUT,DELETE,OPTIONS",
         },
         "body": json.dumps(payload),
     }
@@ -865,19 +1156,11 @@ def handler(event, context):
     method = (ctx.get("http", {}) or {}).get("method", "GET").upper()
     path = (ctx.get("http", {}) or {}).get("path", "/") or "/"
 
-    if method == "OPTIONS":
-        return _json(204, {})
-
-    # The UI shell is public; every /api/* route is authorized below.
-    if path in ("/", "/index.html"):
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "text/html; charset=utf-8",
-                        "Cache-Control": "no-store"},
-            "body": _UI_HTML.replace("__REGION__", _REGION).replace(
-                "__CLIENT_ID__", _CLIENT_ID),
-        }
-
+    # This Lambda now serves the JSON API ONLY. The single-page UI is a static object in
+    # a private S3 bucket, served by the same CloudFront distribution at `/`; CloudFront
+    # routes `/api/*` here. No OPTIONS/CORS preflight handling is needed because the SPA
+    # and this API share one origin. `_UI_HTML` (below) is retained because CDK reads it
+    # at synth time as the S3 asset for the SPA.
     if not path.startswith("/api/"):
         return _json(404, {"error": "not found"})
 
@@ -921,6 +1204,7 @@ def handler(event, context):
         # every page load. Available on demand at /api/diagnostics/spans.
         ledger = _ledger_scan()
         cfg = _list_config()
+        submap = _resolve_submap(ledger)
         return _json(200, {
             "decisions": _decisions(ledger, {
                 "user": qs.get("user"),
@@ -928,8 +1212,8 @@ def handler(event, context):
                 "minutes": qs.get("minutes"),
                 "q": qs.get("q"),
             }),
-            "spend": _spend(ledger),
-            "rate_counters": _rate_counters(ledger),
+            "spend": _spend(ledger, submap),
+            "rate_counters": _rate_counters(ledger, submap, cfg),
             "breakglass": _breakglass(cfg),
             # So the UI can state its own horizon and hand off to the archive instead of
             # rendering an empty table that looks like a fault.
@@ -941,6 +1225,21 @@ def handler(event, context):
 
     if path == "/api/models" and method == "GET":
         return _json(200, _model_inventory(_ledger_scan()))
+
+    if path == "/api/catalog" and method == "GET":
+        # Live foundation-model catalog (both surfaces) for the model pickers.
+        return _json(200, _catalog(_ledger_scan()))
+
+    if path == "/api/costs" and method == "GET":
+        # Per-user daily/monthly cost from the out-of-band rollup — the ">24h" view.
+        period = (qs.get("period") or "daily").lower()
+        if period not in ("daily", "monthly"):
+            period = "daily"
+        try:
+            limit_periods = int(qs.get("periods") or (31 if period == "daily" else 12))
+        except (TypeError, ValueError):
+            limit_periods = 31 if period == "daily" else 12
+        return _json(200, _costs(period, limit_periods))
 
     if path == "/api/guardrails" and method == "GET":
         gid = qs.get("id")
@@ -970,73 +1269,114 @@ _UI_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Inference Governance Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cpath d='M16 5l9 4v7c0 5.5-3.8 9.6-9 11-5.2-1.4-9-5.5-9-11V9z' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3Cpath d='M11 16l3.5 3.5L21 13' fill='none' stroke='%233fb950' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
   :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#30363d;--tx:#e6edf3;
         --dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;
         --vio:#bc8cff}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--tx);
-       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
   header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
          align-items:center;gap:14px}
-  header h1{font-size:15px;margin:0;font-weight:600}
-  header .who{margin-left:auto;color:var(--dim);font-size:12px}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .who{margin-left:auto;color:var(--dim);font-size:13px}
   button{background:var(--acc);color:#0d1117;border:0;border-radius:6px;
-         padding:7px 13px;font-weight:600;cursor:pointer;font-size:13px}
+         padding:7px 13px;font-weight:600;cursor:pointer;font-size:14px}
   button.ghost{background:transparent;color:var(--tx);border:1px solid var(--line)}
   button.danger{background:var(--bad);color:#fff}
-  button.sm{padding:4px 9px;font-size:12px}
+  button.sm{padding:4px 9px;font-size:13px}
   button:disabled{opacity:.5;cursor:not-allowed}
   input,select{background:#0d1117;color:var(--tx);border:1px solid var(--line);
-               border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit}
-  main{padding:20px;max-width:1240px}
-  .tabs{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap}
+               border-radius:6px;padding:7px 9px;font-size:14px;font-family:inherit}
+  /* Center the whole console column on the page (#1). */
+  main{padding:20px;max-width:1180px;margin:0 auto}
+  .tabs{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap;justify-content:center}
   .tabs button{background:transparent;color:var(--dim);border:1px solid transparent}
   .tabs button.on{color:var(--tx);border-color:var(--line);background:var(--panel)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-        padding:16px;margin-bottom:16px}
-  .card h2{margin:0 0 4px;font-size:14px}
-  .card h3{margin:16px 0 6px;font-size:13px}
-  .card p.hint{margin:0 0 12px;color:var(--dim);font-size:12px;line-height:1.6}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);
+        padding:18px;margin-bottom:16px}
+  .card h2{margin:0 0 5px;font-size:15.5px}
+  .card h3{margin:18px 0 7px;font-size:14px}
+  /* Descriptive/explanatory text bumped up proportionally so it is comfortably
+     readable next to the titles (#2). */
+  .card p.hint{margin:0 0 13px;color:var(--dim);font-size:13.5px;line-height:1.65}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);
         vertical-align:middle}
-  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;
+  th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;
      letter-spacing:.4px}
   code{background:#0d1117;border:1px solid var(--line);border-radius:4px;
-       padding:1px 5px;font-size:12px}
+       padding:1px 5px;font-size:13px}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  .pill{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--line)}
+  .pill{font-size:12px;padding:2px 8px;border-radius:20px;border:1px solid var(--line)}
   .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
   .dim{color:var(--dim)}
-  .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
-  .kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
+  .kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px;justify-content:center}
   .kpi{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
-       padding:10px 14px;min-width:120px}
-  .kpi .v{font-size:19px;font-weight:700}
-  .kpi .l{font-size:10.5px;color:var(--dim);text-transform:uppercase;
+       padding:11px 15px;min-width:128px}
+  .kpi .v{font-size:21px;font-weight:700}
+  .kpi .l{font-size:11.5px;color:var(--dim);text-transform:uppercase;
           letter-spacing:.5px;margin-top:2px}
   .note{border-left:3px solid var(--acc);background:#11161f;border-radius:0 8px 8px 0;
-        padding:10px 13px;margin:0 0 14px;font-size:12.5px;color:var(--dim);
-        line-height:1.6}
+        padding:11px 14px;margin:0 0 14px;font-size:13.5px;color:var(--dim);
+        line-height:1.65}
   .note b{color:var(--tx)}
   .note.bad{border-left-color:var(--bad)}
   .note.warn{border-left-color:var(--warn)}
   .banner{background:#3d1d1d;border:1px solid var(--bad);border-radius:9px;
-          padding:12px 15px;margin:0 0 16px;font-size:13px}
+          padding:12px 15px;margin:0 0 16px;font-size:14px}
   .banner b{color:#ffb4ab}
-  #login{max-width:340px;margin:80px auto;text-align:center}
+  #login{max-width:360px;margin:80px auto;text-align:center}
   #login input{width:100%;margin-bottom:9px}
-  #err{color:var(--bad);font-size:12.5px;min-height:18px;margin-top:8px}
+  #err{color:var(--bad);font-size:13.5px;min-height:18px;margin-top:8px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   @media(max-width:900px){.grid2{grid-template-columns:1fr}}
   .scroll{max-height:460px;overflow-y:auto}
   .chips{display:flex;gap:5px;flex-wrap:wrap}
-  .chip{font-size:11px;padding:2px 7px;border-radius:5px;background:#0d1117;
+  .chip{font-size:12px;padding:2px 7px;border-radius:5px;background:#0d1117;
         border:1px solid var(--line)}
   .chip.deny{border-color:#5c2a2a;color:#ff9c8f}
   .chip.allow{border-color:#1d4429;color:#7ee787}
   .muted-row{opacity:.55}
+  /* ---- interactive architecture diagram (#3) ------------------------- */
+  .arch{background:linear-gradient(180deg,#11161f,#0f141c);border:1px solid var(--line);
+        border-radius:10px;padding:14px 16px 8px;margin-bottom:16px}
+  .arch h2{margin:0 0 2px;font-size:15.5px}
+  .arch p.hint{margin:0 0 6px;color:var(--dim);font-size:13.5px;line-height:1.6}
+  .arch svg{display:block;width:100%;max-width:1400px;height:auto;margin:0 auto}
+  /* outer nodes (client, gateway container, bedrock) */
+  .arch .node rect{fill:var(--panel2);stroke:var(--line);stroke-width:1.5}
+  .arch .node.gw rect{fill:#0f1520}
+  .arch .node.enforce rect{stroke:var(--acc);stroke-width:2.5;
+        filter:drop-shadow(0 0 8px rgba(88,166,255,.5))}
+  .arch .node .t{fill:var(--tx);font-size:17px;font-weight:700}
+  .arch .node .gwt{font-size:19px}
+  .arch .node .s{fill:#a9b4c2;font-size:13px}
+  /* lane labels */
+  .arch .lane{fill:#8fa4c0;font-size:12.5px;font-weight:700;letter-spacing:.7px}
+  /* the four numbered layers: HIGH-CONTRAST text, sized to the 200x56 boxes */
+  .arch .layer{fill:#161d2a;stroke:#3a4658;stroke-width:1.5}
+  .arch .layer.on{fill:#17324f;stroke:var(--acc);stroke-width:2.6;
+        filter:drop-shadow(0 0 9px rgba(88,166,255,.6))}
+  .arch .lnum{fill:#8fa4c0;font-size:22px;font-weight:800}
+  .arch .lnum.on{fill:var(--acc)}
+  .arch .lt{fill:#e6edf3;font-size:15px;font-weight:700}
+  .arch .lt.on{fill:#ffffff}
+  .arch .lsub{fill:#a9b4c2;font-size:12px}
+  .arch .lsub.on{fill:#cfe4ff}
+  /* animated flow lines: a dashed stroke marching along the path, with arrowheads */
+  .arch .flow{fill:none;stroke:var(--acc);stroke-width:2.4;stroke-linecap:round;
+        stroke-dasharray:8 8;animation:flow 1.1s linear infinite;opacity:.9}
+  .arch .flow.back{stroke:var(--vio);opacity:.75}
+  .arch .flow.hot{stroke-width:3.4;opacity:1}
+  .arch .flow.hot-v{stroke-width:3.4;opacity:1}
+  @keyframes flow{to{stroke-dashoffset:-32}}
+  @media (prefers-reduced-motion: reduce){.arch .flow{animation:none}}
+  /* the "enforcement point" badge: a filled pill above the highlighted layer */
+  .arch .badge-bg{fill:var(--acc)}
+  .arch .badge{fill:#0d1117;font-size:12px;font-weight:800;letter-spacing:.3px}
 </style>
 </head>
 <body>
@@ -1065,14 +1405,22 @@ _UI_HTML = r"""<!DOCTYPE html>
 </header>
 <main>
   <div id="bg-banner"></div>
+  <div id="arch"></div>
   <div id="view"></div>
 </main>
 </div>
 
 <script>
-const REGION="__REGION__", CLIENT_ID="__CLIENT_ID__";
+/* Region + Cognito client id are no longer templated into the page: the SPA is now a
+   static object served from S3 behind CloudFront, so there is no server-side render step
+   to substitute them. They are fetched once from the unauthenticated GET /api/meta on
+   load (see start()). */
+let REGION="", CLIENT_ID="";
 let TOKEN=sessionStorage.getItem("tok")||"", USER=sessionStorage.getItem("usr")||"";
 let CFG=[], IDS={users:[],groups:[]}, MODELS=[], PRICED=[], GUARDS=[], TAB="access";
+/* Live foundation-model catalog from BOTH Bedrock surfaces (GET /api/catalog), for the
+   model pickers. {runtime:[], mantle:[], configured:[], observed:[], all:[]}. */
+let CATALOG={runtime:[],mantle:[],configured:[],observed:[],all:[]};
 /* Retention metadata from /api/stats: the console's own history horizon plus where the
    durable copy lives. Defaults match config.DECISION_RECORD_TTL_SECONDS so the first
    render before any fetch is still truthful. */
@@ -1112,14 +1460,16 @@ async function boot(){
   show("app");
   document.getElementById("who").textContent=USER;
   try{
-    const [c,i,m,g]=await Promise.all([
-      api("/config"), api("/identities"), api("/models"), api("/guardrails")]);
+    const [c,i,m,g,cat]=await Promise.all([
+      api("/config"), api("/identities"), api("/models"), api("/guardrails"),
+      api("/catalog").catch(()=>null)]);
     GUARDS=(g&&g.guardrails)||[];
     CFG=c.items||[]; IDS=i||IDS;
     // Glob targets are REQUEST-shaped model ids. Deliberately not the pricing table's
     // normalized keys: `*claude-opus*` matches `anthropic.claude-opus-5` but NOT
     // `claudeopus5`, so using pricing keys reported the opposite verdict.
     MODELS=(m&&m.glob_targets)||[]; PRICED=(m&&m.priced)||[];
+    if(cat) CATALOG=cat;
     tab(TAB);
     checkBreakGlass();
   }catch(x){
@@ -1163,6 +1513,33 @@ function scopeLabel(pk){
   return `<code>${esc(pk)}</code>`;
 }
 
+/* ---------- model picker: real, live Bedrock ids from BOTH surfaces ----------
+   Populated from /api/catalog so an admin builds policy against models that ACTUALLY
+   exist on the deployment's endpoints, grouped by where each id is reachable. A few
+   common glob PATTERNS lead the list because MODELS rules are glob-matched (a pattern
+   like *claude-opus* is not itself a model id). Falls back to the configured/observed
+   set if the live catalog was unavailable. */
+function modelSelect(id){
+  const opt=v=>`<option value="${esc(v)}">${esc(v)}</option>`;
+  const grp=(label,arr)=>{
+    const a=(arr||[]).filter(Boolean);
+    return a.length?`<optgroup label="${esc(label)}">${a.map(opt).join("")}</optgroup>`:"";
+  };
+  const patterns=["*","*claude-opus*","*claude-sonnet*","*claude-haiku*","us.*"];
+  // De-dupe mantle vs runtime overlap for readability.
+  const mantle=CATALOG.mantle||[], runtime=CATALOG.runtime||[];
+  const extra=(CATALOG.configured||[]).concat(CATALOG.observed||[])
+    .filter(v=>v && mantle.indexOf(v)<0 && runtime.indexOf(v)<0);
+  const uniqExtra=[...new Set(extra)];
+  return `<select id="${id}">
+    <option value="">choose a model or pattern...</option>
+    <optgroup label="Glob patterns">${patterns.map(opt).join("")}</optgroup>
+    ${grp("bedrock-mantle (foundation models)",mantle)}
+    ${grp("bedrock-runtime (inference profiles)",runtime)}
+    ${grp("configured / seen in traffic",uniqExtra)}
+  </select>`;
+}
+
 async function put(pk,sk,extra){
   const body=Object.assign({pk:pk,sk:sk},extra);
   const r=await api("/config",{method:"PUT",body:JSON.stringify(body)});
@@ -1198,7 +1575,132 @@ function tab(t){
   TAB=t;
   document.querySelectorAll(".tabs button").forEach(b=>
     b.classList.toggle("on",b.dataset.t===t));
+  document.getElementById("arch").innerHTML=archDiagram(t);
   ({access:viewAccess,limits:viewLimits,guard:viewGuard,stats:viewStats}[t])();
+}
+
+/* =======================================================================
+   INTERACTIVE ARCHITECTURE DIAGRAM (#3)
+   Client -> AgentCore Inference Gateway (4 ordered layers) -> Amazon Bedrock.
+   The layer that enforces THIS page's policy is highlighted and its flow line
+   runs "hot". Animated dashed flow lines match the console theme.
+   ======================================================================= */
+function archDiagram(t){
+  // Which gateway layer each tab configures, and how to describe it.
+  const M={
+    access:{layer:"req", title:"Model access is enforced in the REQUEST interceptor",
+      sub:"Before dispatch, the interceptor resolves your MODELS allow/deny globs for the caller and refuses a denied model on BOTH surfaces."},
+    limits:{layer:"req", title:"Rate &amp; cost are enforced in the REQUEST interceptor",
+      sub:"The interceptor meters tokens/requests and reserves spend against the daily and monthly budgets before the request reaches Bedrock."},
+    guard:{layer:"req", title:"Guardrails are enforced in the REQUEST interceptor",
+      sub:"The interceptor calls ApplyGuardrail with the guardrail bound to the caller's scope, and blocks a disallowed prompt before dispatch."},
+    stats:{layer:"both", title:"Statistics come from BOTH interceptors",
+      sub:"The request side records the decision and identity; the response side reconciles true cost and stamps the final outcome into the audit log."}
+  };
+  const info=M[t]||M.access;
+  const on=info.layer;                 // 'req' | 'both'
+  const reqOn = on==="req"||on==="both";
+  const respOn = on==="both";
+
+  /* Layout: TWO lanes inside the gateway box, all positions COMPUTED from constants so the
+     boxes, gaps and arrows are guaranteed not to collide or clip.
+       top lane    = the REQUEST path, left->right: 1 JWT auth -> 2 REQUEST -> 3 Cedar -> Bedrock
+       bottom lane = the RESPONSE path, right->left: Bedrock -> 4 RESPONSE -> Client
+     Layer boxes are wide enough for their text, separated by real gaps carrying visible
+     arrows, and Client/Bedrock sit centred between the two lanes so both arrows meet them. */
+  const LW=250, LH=58, GAP=48;               // layer box (wide enough for its text) + gap
+  const PAD=36;                              // gateway inner padding
+  const NW=176, NH=88;                       // client/bedrock box size
+  const CX=30;                               // client x
+  const GX=CX+NW+90;                         // gateway x: after client + arrow run
+  const GW=3*LW+2*GAP+2*PAD;                 // gateway width from the layer geometry
+  const GXR=GX+GW;                           // gateway right edge
+  const BX=GXR+90;                           // bedrock x: after gateway + arrow run
+  const W=BX+NW+30, H=410;                   // canvas sized to the content, never guessed
+  const L1=GX+PAD, L2=L1+LW+GAP, L3=L2+LW+GAP; // layer x positions
+  const REQ_Y=200, RESP_Y=306;               // lane box tops
+  const REQ_C=REQ_Y+LH/2, RESP_C=RESP_Y+LH/2;// lane centre lines
+  const MID=(REQ_C+RESP_C)/2;                // vertical centre for Client/Bedrock
+
+  const lyr=(x,y,num,label,sub,active)=>`
+    <g>
+      <rect class="layer${active?' on':''}" x="${x}" y="${y}" width="${LW}" height="${LH}" rx="8"/>
+      <text class="lnum${active?' on':''}" x="${x+16}" y="${y+37}">${num}</text>
+      <text class="lt${active?' on':''}" x="${x+46}" y="${y+26}">${label}</text>
+      <text class="lsub${active?' on':''}" x="${x+46}" y="${y+45}">${sub}</text>
+    </g>`;
+  // Badge: a filled pill centred ABOVE the highlighted layer, in clear space.
+  const badge=(x,y,text)=>`
+    <g>
+      <rect class="badge-bg" x="${x+LW/2-84}" y="${y-30}" width="168" height="22" rx="11"/>
+      <text class="badge" x="${x+LW/2}" y="${y-14}" text-anchor="middle">&#9679; ${text}</text>
+    </g>`;
+  const reqBadge  = reqOn  ? badge(L2,REQ_Y,"enforcement point") : "";
+  const respBadge = respOn ? badge(L2,RESP_Y,"recorded here") : "";
+
+  return `
+  <div class="arch">
+    <h2>${info.title}</h2>
+    <p class="hint">${info.sub}</p>
+    <svg viewBox="0 0 ${W} ${H}" role="img"
+         aria-label="Architecture: client to AgentCore Inference Gateway to Amazon Bedrock">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8"
+                orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--acc)"/>
+        </marker>
+        <marker id="arrv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8"
+                orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--vio)"/>
+        </marker>
+      </defs>
+
+      <!-- lane labels, left of the first layer -->
+      <text class="lane" x="${L1}" y="${REQ_Y-10}">REQUEST &rarr;</text>
+      <text class="lane" x="${L1}" y="${RESP_Y-10}">&larr; RESPONSE</text>
+
+      <!-- client: spans both lanes so each lane's arrow meets it straight on -->
+      <g class="node">
+        <rect x="${CX}" y="${REQ_Y}" width="${NW}" height="${RESP_Y+LH-REQ_Y}" rx="10"/>
+        <text class="t" x="${CX+NW/2}" y="${MID-6}" text-anchor="middle">Client</text>
+        <text class="s" x="${CX+NW/2}" y="${MID+16}" text-anchor="middle">Cognito bearer token</text>
+      </g>
+
+      <!-- gateway container: sized from the layer geometry so it always encloses them -->
+      <g class="node gw ${reqOn||respOn?'enforce':''}">
+        <rect x="${GX}" y="64" width="${GW}" height="${RESP_Y+LH+30-64}" rx="12"/>
+        <text class="t gwt" x="${GX+GW/2}" y="98" text-anchor="middle">AgentCore Inference Gateway</text>
+        <text class="s" x="${GX+GW/2}" y="120" text-anchor="middle">one governance plane, both Bedrock surfaces</text>
+      </g>
+
+      ${reqBadge}
+      ${lyr(L1,REQ_Y,"1","JWT auth","validates the Cognito token",false)}
+      ${lyr(L2,REQ_Y,"2","REQUEST interceptor","model, rate, cost, guardrail",reqOn)}
+      ${lyr(L3,REQ_Y,"3","Cedar policy","may you use the gateway?",false)}
+
+      ${respBadge}
+      ${lyr(L2,RESP_Y,"4","RESPONSE interceptor","true cost, outcome, audit",respOn)}
+
+      <!-- bedrock: spans both lanes, like the client -->
+      <g class="node">
+        <rect x="${BX}" y="${REQ_Y}" width="${NW}" height="${RESP_Y+LH-REQ_Y}" rx="10"/>
+        <text class="t" x="${BX+NW/2}" y="${MID-6}" text-anchor="middle">Amazon Bedrock</text>
+        <text class="s" x="${BX+NW/2}" y="${MID+16}" text-anchor="middle">mantle + runtime</text>
+      </g>
+
+      <!-- FLOW LINES LAST, so they paint ON TOP of every box and the arrowheads are never
+           hidden under a rect. All straight horizontals at the lane centrelines: the
+           request runs left->right along the top lane, the response right->left along the
+           bottom lane. Each arrow stops 4px short of its target box edge. -->
+      <path class="flow" marker-end="url(#arr)" d="M${CX+NW},${REQ_C} H${L1-4}"/>
+      <path class="flow" marker-end="url(#arr)" d="M${L1+LW},${REQ_C} H${L2-4}"/>
+      <path class="flow ${reqOn?'hot':''}" marker-end="url(#arr)" d="M${L2+LW},${REQ_C} H${L3-4}"/>
+      <path class="flow ${reqOn?'hot':''}" marker-end="url(#arr)" d="M${L3+LW},${REQ_C} H${BX-4}"/>
+
+      <path class="flow back" marker-end="url(#arrv)" d="M${BX},${RESP_C} H${L2+LW+4}"/>
+      <path class="flow back ${respOn?'hot-v':''}" marker-end="url(#arrv)" d="M${L2},${RESP_C} H${CX+NW+4}"/>
+    </svg>
+  </div>`;
 }
 
 /* =======================================================================
@@ -1255,7 +1757,8 @@ function viewAccess(){
        <code>*claude-opus*</code> does not match <code>claudeopus5</code>.</p>
     <div class="row">
       <select id="eff-user"><option value="">select a user...</option>${userOpts}</select>
-      <input id="eff-probe" placeholder="optional: test any model id" style="min-width:260px">
+      ${modelSelect("eff-probe-pick")}
+      <input id="eff-probe" placeholder="or type any model id" style="min-width:220px">
       <button onclick="loadEffective()">Show effective access</button>
     </div>
     <div id="eff-out" style="margin-top:14px"></div>
@@ -1272,8 +1775,7 @@ function viewAccess(){
       <div>
         <label class="dim">Allow these models</label>
         <div class="row" style="margin:6px 0">
-          <select id="ma-allow-pick"><optgroup label="Patterns">${globOpts}</optgroup>
-            <optgroup label="Exact model ids">${modelOpts}</optgroup></select>
+          ${modelSelect("ma-allow-pick")}
           <button class="ghost sm" onclick="addGlob('allow')">Add</button>
         </div>
         <div class="chips" id="ma-allow-list"></div>
@@ -1281,9 +1783,7 @@ function viewAccess(){
       <div>
         <label class="dim">Deny these models (wins over allow)</label>
         <div class="row" style="margin:6px 0">
-          <select id="ma-deny-pick"><option value="">choose...</option>
-            <optgroup label="Patterns">${globOpts}</optgroup>
-            <optgroup label="Exact model ids">${modelOpts}</optgroup></select>
+          ${modelSelect("ma-deny-pick")}
           <button class="ghost sm" onclick="addGlob('deny')">Add</button>
         </div>
         <div class="chips" id="ma-deny-list"></div>
@@ -1331,7 +1831,10 @@ async function loadEffective(){
   const out=document.getElementById("eff-out");
   if(!u){out.innerHTML="";return;}
   out.innerHTML='<span class="dim">resolving...</span>';
-  const probe=(document.getElementById("eff-probe")||{}).value||"";
+  // The picker wins if used; otherwise the free-text box. Both feed the same probe.
+  const picked=(document.getElementById("eff-probe-pick")||{}).value||"";
+  const typed=(document.getElementById("eff-probe")||{}).value||"";
+  const probe=picked||typed;
   const r=await api("/effective?username="+encodeURIComponent(u)+
     (probe?"&probe="+encodeURIComponent(probe):""));
   if(r.error&&!r.models){out.innerHTML=`<div class="note bad">${esc(r.error)}</div>`;return;}
@@ -1378,13 +1881,19 @@ function viewLimits(){
       <td style="text-align:right">${r.pk==="DEFAULT"?"":
         `<button class="danger sm" onclick="del('${esc(r.pk)}','RATELIMIT')">Delete</button>`}</td>
     </tr>`).join("");
-  const bd=rowsOf("BUDGET").map(r=>`<tr>
+  const bd=rowsOf("BUDGET").map(r=>{
+    // New rows carry daily/monthly; a legacy row carries only budget_usd (treated as
+    // the daily cap by the interceptor), so fall back to it for display.
+    const daily=Number(r.daily_budget_usd||r.budget_usd||0);
+    const monthly=Number(r.monthly_budget_usd||0);
+    const cell=v=>v>0?`$${v.toFixed(4)}`:'<span class="dim">&mdash;</span>';
+    return `<tr>
       <td>${scopeLabel(r.pk)}</td>
-      <td>$${Number(r.budget_usd||0).toFixed(4)}</td>
-      <td>${orDash(r.window_seconds,"s")}</td>
+      <td>${cell(daily)}</td>
+      <td>${cell(monthly)}</td>
       <td style="text-align:right">${r.pk==="DEFAULT"?"":
         `<button class="danger sm" onclick="del('${esc(r.pk)}','BUDGET')">Delete</button>`}</td>
-    </tr>`).join("");
+    </tr>`;}).join("");
 
   document.getElementById("view").innerHTML=`
   <div class="card">
@@ -1430,26 +1939,30 @@ function viewLimits(){
   <div class="card">
     <h2>Cost budgets</h2>
     <p class="hint">
-      A spend cap per principal per window, enforced against a DynamoDB ledger. Over budget
-      returns <code>429 cost_budget_exceeded</code>.
+      Independent <b>daily</b> and <b>monthly</b> spend caps per principal, enforced against a
+      DynamoDB ledger. <b>Either cap can deny</b> &mdash; over the daily OR the monthly limit
+      returns <code>429 cost_budget_exceeded</code>, and the message says which window tripped.
+      Leave a field blank (or 0) to not enforce that window.
       <br><br>
       <b>It reserves, then reconciles.</b> Output tokens do not exist before dispatch, so the
-      request side charges the prompt <em>plus the caller's declared output ceiling</em>, and
-      the response side replaces that reservation with the real cost. This makes the control
-      pessimistic (it can block slightly early) rather than leaky &mdash; charging the prompt
-      alone would let a burst of large generations overshoot before reconciliation caught up.
-      Prices come from the live pricing table, refreshed daily, not from constants.
+      request side charges the prompt <em>plus the caller's declared output ceiling</em>
+      against both the day and month counters, and the response side replaces that reservation
+      with the real cost. This makes the control pessimistic (it can block slightly early)
+      rather than leaky. Prices come from the live pricing table, refreshed daily, not from
+      constants.
       <br><br>
+      Counters are <b>calendar-aligned</b> in UTC: the daily counter resets at 00:00 UTC and
+      the monthly counter on the 1st.
       <span class="dim">Budgets are not pooled the way rate limits are: a
       <code>GROUP#</code> budget currently applies per member.</span>
     </p>
-    <table><thead><tr><th>Scope</th><th>Budget</th><th>Window</th><th></th></tr></thead>
+    <table><thead><tr><th>Scope</th><th>Daily cap</th><th>Monthly cap</th><th></th></tr></thead>
       <tbody>${bd||'<tr><td colspan="4" class="dim">no budgets configured</td></tr>'}</tbody></table>
     <h3>Add or update a budget</h3>
     <div class="row">
       ${scopeSelect("bd-scope")}
-      <input id="bd-usd" type="number" step="0.0001" min="0" placeholder="budget USD" style="width:130px">
-      <input id="bd-win" type="number" min="1" value="60" style="width:90px" title="window seconds">
+      <input id="bd-daily" type="number" step="0.0001" min="0" placeholder="daily USD" style="width:130px">
+      <input id="bd-monthly" type="number" step="0.0001" min="0" placeholder="monthly USD" style="width:140px">
       <button onclick="saveCost()">Save</button>
       <span class="dim" id="bd-msg"></span>
     </div>
@@ -1457,9 +1970,14 @@ function viewLimits(){
 
   <div class="card">
     <h2>Live counters</h2>
-    <p class="hint">Current window state, straight from the ledger. Pooled rows are keyed on a
-       group, per-user rows on a Cognito <code>sub</code> &mdash; seeing both is how you
-       confirm pooling is actually in effect.</p>
+    <p class="hint">Straight from the ledger, not from a report. Rate rows are the counters
+       for the <b>current rate window only</b> (a 60s window means a row appears while
+       traffic is flowing and is gone a minute later); pooled (group) and per-user rows sit
+       side by side, which is how you confirm pooling is in effect. Spend rows are the
+       calendar <b>day</b> and <b>month</b> counters the budget caps are enforced against,
+       shown by <b>username</b> (resolved from the request records, so a brand-new user with
+       no traffic yet may still show a raw id). For cost over time, see Cost history on the
+       Statistics tab, which is fed by the out-of-band rollup.</p>
     <div id="ctr-out" class="dim">loading...</div>
   </div>`;
   loadCounters();
@@ -1479,28 +1997,32 @@ async function saveRate(){
 async function saveCost(){
   const pk=document.getElementById("bd-scope").value;
   const msg=document.getElementById("bd-msg"); msg.textContent="saving...";
+  const daily=Number(document.getElementById("bd-daily").value||0);
+  const monthly=Number(document.getElementById("bd-monthly").value||0);
+  if(daily<=0&&monthly<=0&&!confirm("Both caps are blank, so this scope will have no cost budget. Continue?"))return;
   const ok=await put(pk,"BUDGET",{
-    budget_usd:Number(document.getElementById("bd-usd").value||0),
-    window_seconds:Number(document.getElementById("bd-win").value||60)});
+    daily_budget_usd:daily, monthly_budget_usd:monthly});
   msg.textContent=ok?"saved - enforced within ~10s":"";
   if(ok)tab("limits");
 }
 async function loadCounters(){
-  const s=await api("/stats?minutes=60");
+  // Last 24 hours (#6). The spend rows are the current day/month calendar counters.
+  const s=await api("/stats?minutes=1440");
   const el=document.getElementById("ctr-out"); if(!el)return;
   const rc=s.rate_counters||[], sp=s.spend||[];
   el.innerHTML=`
     <table><thead><tr><th>Rate counter subject</th><th>Sharing</th><th>Tokens</th>
       <th>Requests</th></tr></thead><tbody>
-      ${rc.length?rc.map(r=>`<tr><td class="mono">${esc(r.subject)}</td>
+      ${rc.length?rc.map(r=>`<tr><td class="mono" title="${esc(r.subject_key||r.subject)}">${esc(r.subject)}</td>
         <td>${r.pooled?'<span class="pill ok">pooled</span>':'<span class="pill">per user</span>'}</td>
         <td>${r.tokens}</td><td>${r.requests}</td></tr>`).join("")
         :'<tr><td colspan="4" class="dim">no active counters</td></tr>'}
     </tbody></table>
-    <table style="margin-top:14px"><thead><tr><th>Spend: user (sub)</th><th>Window</th>
+    <table style="margin-top:14px"><thead><tr><th>Spend: user</th><th>Window</th>
       <th>Spend</th></tr></thead><tbody>
-      ${sp.length?sp.map(r=>`<tr><td class="mono">${esc(r.sub)}</td>
-        <td class="mono">${esc(r.window)}</td>
+      ${sp.length?sp.map(r=>`<tr><td>${r.username?esc(r.username):
+          `<span class="mono dim" title="no username mapped yet">${esc(r.sub)}</span>`}</td>
+        <td>${esc(r.window_label||r.window)}</td>
         <td>$${Number(r.spend_usd).toFixed(6)}</td></tr>`).join("")
         :'<tr><td colspan="3" class="dim">no spend recorded</td></tr>'}
     </tbody></table>`;
@@ -1658,7 +2180,8 @@ async function previewGuard(gid,ver){
 /* =======================================================================
    STATISTICS
    ======================================================================= */
-let SF={user:"",group:"",minutes:"60",q:""};
+let SF={user:"",group:"",minutes:"1440",q:""};
+let COSTPERIOD="daily";
 function viewStats(){
   const uo=IDS.users.map(u=>`<option value="${esc(u.username)}"${SF.user===u.username?" selected":""}>${esc(u.username)}</option>`).join("");
   const go=IDS.groups.map(g=>`<option value="${esc(g.name)}"${SF.group===g.name?" selected":""}>${esc(g.name)}</option>`).join("");
@@ -1697,10 +2220,33 @@ function viewStats(){
       <input id="sf-q" placeholder="search model, path, decision, scope..."
              value="${esc(SF.q)}" style="min-width:260px">
       <button onclick="applyStats()">Apply</button>
-      <button class="ghost" onclick="SF={user:'',group:'',minutes:'60',q:''};viewStats()">Reset</button>
+      <button class="ghost" onclick="SF={user:'',group:'',minutes:'1440',q:''};viewStats()">Reset</button>
     </div>
     <div id="st-out" class="dim">loading...</div>
   </div>
+
+  <div class="card">
+    <h2>Cost history &mdash; daily &amp; monthly, per user</h2>
+    <p class="hint">
+      Per-request records expire after ${esc(RET.decision_window_label||"a short window")},
+      which is too short to answer "what did this user spend this month". So a scheduled
+      <b>rollup</b> folds each request's true cost into durable per-user <b>daily</b> and
+      <b>monthly</b> totals BEFORE the raw records expire, and this view reads those.
+      <br><br>
+      It runs <b>out of band</b> &mdash; on a schedule, reading the ledger &mdash; not in the
+      request or response interceptors, so looking back over weeks of cost adds nothing to the
+      enforcement path.
+    </p>
+    <div class="row" style="margin-bottom:12px">
+      <select id="cost-period" onchange="COSTPERIOD=this.value;loadCosts()">
+        <option value="daily">daily</option>
+        <option value="monthly">monthly</option>
+      </select>
+      <button class="ghost" onclick="loadCosts()">Refresh</button>
+    </div>
+    <div id="cost-out" class="dim">loading...</div>
+  </div>
+
   <div class="card">
     <h2>Gateway span diagnostics <span class="pill">opt-in</span></h2>
     <p class="hint">
@@ -1720,6 +2266,7 @@ function viewStats(){
     <div id="sp-out" style="margin-top:12px"></div>
   </div>`;
   loadStats();
+  loadCosts();
 }
 function applyStats(){
   SF={user:document.getElementById("sf-user").value,
@@ -1779,6 +2326,39 @@ async function loadStats(){
       <tbody>${rows||`<tr><td colspan="10" class="dim">${emptyMsg(d)}</td></tr>`}</tbody>
     </table></div>
     ${archiveNote(s.retention,d)}`;
+}
+
+/* Cost history from the out-of-band rollup (#7): per-user daily or monthly totals that
+   outlive the 24h decision records. */
+async function loadCosts(){
+  const out=document.getElementById("cost-out"); if(!out)return;
+  const sel=document.getElementById("cost-period"); if(sel)sel.value=COSTPERIOD;
+  out.textContent="loading...";
+  let c;
+  try{ c=await api("/costs?period="+encodeURIComponent(COSTPERIOD)); }
+  catch(x){ out.innerHTML=`<div class="note bad">${esc(String(x))}</div>`; return; }
+  if(c.error){ out.innerHTML=`<div class="note warn">${esc(c.error)}</div>`; return; }
+  const rows=(c.rows||[]).map(r=>`<tr>
+      <td>${esc(r.username)}</td>
+      <td>${esc(r.period_label||r.period)}</td>
+      <td style="text-align:right">$${Number(r.cost_usd||0).toFixed(6)}</td>
+      <td style="text-align:right">${r.requests||0}</td>
+    </tr>`).join("");
+  const totals=Object.entries(c.by_user||{})
+    .sort((a,b)=>b[1].cost_usd-a[1].cost_usd)
+    .map(([u,v])=>`<tr><td>${esc(u)}</td>
+      <td style="text-align:right">$${Number(v.cost_usd||0).toFixed(6)}</td>
+      <td style="text-align:right">${v.requests||0}</td></tr>`).join("");
+  const label=COSTPERIOD==="monthly"?"month":"day";
+  out.innerHTML=`
+    <h3>Per-user total across the shown ${esc(label)}s</h3>
+    <table><thead><tr><th>User</th><th style="text-align:right">Total cost</th>
+      <th style="text-align:right">Requests</th></tr></thead>
+      <tbody>${totals||`<tr><td colspan="3" class="dim">no rollup data yet &mdash; the rollup runs on a schedule; send some traffic and check back</td></tr>`}</tbody></table>
+    <h3>By ${esc(label)}</h3>
+    <div class="scroll"><table><thead><tr><th>User</th><th>${esc(label[0].toUpperCase()+label.slice(1))}</th>
+      <th style="text-align:right">Cost</th><th style="text-align:right">Requests</th></tr></thead>
+      <tbody>${rows||`<tr><td colspan="4" class="dim">no ${esc(label)} rows yet</td></tr>`}</tbody></table></div>`;
 }
 
 /* The range select is built before the first /api/stats response, so it starts from the
@@ -1875,7 +2455,21 @@ async function loadSpans(){
     <p class="hint">By status: ${kv(e.by_status)}<br>By layer: ${kv(e.by_layer)}</p>`;
 }
 
-if(TOKEN)boot();
+/* Bootstrap: fetch region + client id from the public /api/meta before anything that
+   needs them (login talks to Cognito directly, which requires CLIENT_ID). Same-origin
+   relative fetch works because CloudFront routes /api/* to the API origin. */
+async function start(){
+  try{
+    const m=await fetch("/api/meta").then(r=>r.json());
+    REGION=m.region||""; CLIENT_ID=m.client_id||"";
+  }catch(x){
+    document.getElementById("err").textContent=
+      "could not load console configuration: "+String(x);
+    return;
+  }
+  if(TOKEN){boot();}else{show("login");}
+}
+start();
 </script>
 </body></html>
 """

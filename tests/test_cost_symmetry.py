@@ -8,8 +8,10 @@ budget, pushing them further over and extending their own lockout.
 
 Two things are checked, and the second is the one that keeps this from rotting:
 
-  1. `_refund_reservation` writes the exact negative of the reservation, to the same
-     window counter the charge went to.
+  1. `_refund_reservation` writes the exact negative of the reservation to BOTH calendar
+     counters the charge went to (daily `<sub>#D#YYYYMMDD` and monthly `<sub>#M#YYYYMM`).
+     Symmetry is load-bearing: an asymmetric add/subtract drives a counter negative, and a
+     negative total silently disables its cap.
   2. STRUCTURALLY, by reading the AST: every `return` inside `_govern` funnels through
      `_finish` (or a replay / an early pre-charge exit). That is what makes the refund
      impossible for the NEXT new control to forget — a per-deny-path refund would be
@@ -52,33 +54,40 @@ rec = Recorder()
 gr._ddb = rec
 gr._COST_TABLE = "test-ledger"
 
-STATE = {"charged": 0.01234, "sub": "user-sub-abc", "bucket": 471234, "total": 0.5}
+STATE = {"charged": 0.01234, "sub": "user-sub-abc",
+         "day_pk": "user-sub-abc#D#20260919", "month_pk": "user-sub-abc#M#202609",
+         "daily_total": 0.5, "monthly_total": 0.9}
 gr._refund_reservation(STATE, "guardrail_blocked")
 
 checks = []
-if len(rec.calls) != 1:
-    checks.append((f"exactly one ledger write (got {len(rec.calls)})", False))
+if len(rec.calls) != 2:
+    checks.append((f"exactly two ledger writes, day + month (got {len(rec.calls)})", False))
 else:
-    call = rec.calls[0]
-    amount = float(call["ExpressionAttributeValues"][":d"]["N"])
-    checks.append(("refund is negative", amount < 0))
-    checks.append((f"refund magnitude == charge ({amount})",
-                   abs(amount + STATE["charged"]) < 1e-12))
-    checks.append(("targets the same window counter as the charge",
-                   call["Key"]["pk"]["S"] == "user-sub-abc#471234"))
-    checks.append(("uses ADD, not SET (concurrent requests share the counter)",
-                   "ADD spend" in call["UpdateExpression"]))
+    targeted = {c["Key"]["pk"]["S"] for c in rec.calls}
+    checks.append(("targets the daily AND the monthly counter the charge went to",
+                   targeted == {STATE["day_pk"], STATE["month_pk"]}))
+    for call in rec.calls:
+        which = "day" if call["Key"]["pk"]["S"] == STATE["day_pk"] else "month"
+        amount = float(call["ExpressionAttributeValues"][":d"]["N"])
+        checks.append((f"{which} refund is negative", amount < 0))
+        checks.append((f"{which} refund magnitude == charge ({amount})",
+                       abs(amount + STATE["charged"]) < 1e-12))
+        checks.append((f"{which} uses ADD, not SET (concurrent requests share the counter)",
+                       "ADD spend" in call["UpdateExpression"]))
 
-# A refund must never be invented from an incomplete reservation: a missing sub or bucket
-# would address the WRONG counter, and a zero charge has nothing to reverse.
-for label, bad in (("no charge", {"charged": 0.0, "sub": "s", "bucket": 1}),
-                   ("no sub", {"charged": 1.0, "sub": "", "bucket": 1}),
-                   ("no bucket", {"charged": 1.0, "sub": "s", "bucket": None}),
-                   ("empty state", {})):
+# A refund must never be invented from an incomplete reservation: a zero charge has nothing
+# to reverse, and a counter key that is missing must be skipped rather than guessed (a wrong
+# key would credit the WRONG counter). A reservation that reached only one counter is
+# reversed on that one counter only.
+for label, bad, expect_writes in (
+        ("no charge", {"charged": 0.0, "sub": "s", "day_pk": "s#D#1", "month_pk": "s#M#1"}, 0),
+        ("empty state", {}, 0),
+        ("no keys at all", {"charged": 1.0, "sub": "s"}, 0),
+        ("day key only", {"charged": 1.0, "sub": "s", "day_pk": "s#D#1", "month_pk": ""}, 1)):
     rec.calls.clear()
     gr._refund_reservation(bad, "x")
-    checks.append((f"no write for an incomplete reservation ({label})",
-                   not rec.calls))
+    checks.append((f"{expect_writes} write(s) for a partial reservation ({label})",
+                   len(rec.calls) == expect_writes))
 
 for label, ok in checks:
     if not ok:

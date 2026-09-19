@@ -1,4 +1,4 @@
-﻿"""Phase 1 foundation stack for the AgentCore Gateway inference-governance pilot.
+"""Phase 1 foundation stack for the AgentCore Gateway inference-governance pilot.
 
 Resources (all prefixed `acgw-pilot`, isolated in this stack):
   - Gateway execution IAM role
@@ -27,6 +27,11 @@ from aws_cdk import aws_apigatewayv2 as apigw
 from aws_cdk import aws_apigatewayv2_integrations as apigw_int
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_s3_deployment as s3_deployment
+from aws_cdk import aws_cloudfront as cloudfront
+from aws_cdk import aws_cloudfront_origins as cloudfront_origins
+from aws_cdk import Fn
 from constructs import Construct
 
 from . import config
@@ -36,6 +41,34 @@ from .guards import NoPublicLambdaAspect
 _GUARDRAIL_LAMBDA_DIR = os.path.join(os.path.dirname(__file__), "lambda", "guardrail")
 _ADMIN_LAMBDA_DIR = os.path.join(os.path.dirname(__file__), "lambda", "admin")
 _USAGE_LAMBDA_DIR = os.path.join(os.path.dirname(__file__), "lambda", "usage")
+_ROLLUP_LAMBDA_DIR = os.path.join(os.path.dirname(__file__), "lambda", "rollup")
+
+
+def _load_admin_ui_html() -> str:
+    """Return the admin console SPA HTML (the `_UI_HTML` constant in the admin handler).
+
+    The single-file UI lives in the Lambda handler module so there is ONE copy of it,
+    but that module cannot simply be imported here: at import it creates boto3 clients
+    and reads required env vars (`CONFIG_TABLE` etc.), which are absent at synth time.
+    So the string literal is extracted statically via the AST — no execution, no
+    import-time side effects.
+    """
+    import ast
+
+    src_path = os.path.join(_ADMIN_LAMBDA_DIR, "index.py")
+    with open(src_path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Name) and target.id == "_UI_HTML"
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)):
+                    return node.value.value
+    raise RuntimeError(
+        f"_UI_HTML string constant not found in {src_path} — the admin console SPA "
+        "source must define it at module scope for the CloudFront/S3 deployment."
+    )
 _PRICING_LAMBDA_DIR = os.path.join(os.path.dirname(__file__), "lambda", "pricing")
 
 
@@ -57,8 +90,8 @@ class FoundationStack(Stack):
         # scopes to models, rate limits, budgets and guardrails.
         #
         # Construct id `Cognito3` (was Cognito2) forces a REPLACEMENT pool. Deleting the
-        # `custom:tier` attribute in place is impossible â€” Cognito answers
-        # "Existing schema attributes cannot be modified or deleted" â€” and renaming the
+        # `custom:tier` attribute in place is impossible — Cognito answers
+        # "Existing schema attributes cannot be modified or deleted" — and renaming the
         # pool does not replace it either. Replacement is the only route. Clients are
         # unaffected: the notebook calls ic.discover(), which reads the stack-level
         # UserPoolId / UserPoolClientId outputs rather than hardcoding ids.
@@ -71,7 +104,7 @@ class FoundationStack(Stack):
 
         # Guardrail enforcement via a REQUEST interceptor Lambda (the working path
         # after native guardrail-in-policy couldn't extract the prompt string from
-        # the Messages array body â€” see findings.md). Built BEFORE the gateway
+        # the Messages array body — see findings.md). Built BEFORE the gateway
         # because the gateway's interceptor_configurations references the Lambda ARN.
         self._guardrail = self._build_bedrock_guardrail()
         # Cost ledger: the ONLY way to cap spend uniformly across both Bedrock
@@ -86,6 +119,11 @@ class FoundationStack(Stack):
         # Real Bedrock rates, refreshed daily from the Price List API. Built before the
         # interceptors because both of them price requests from it.
         self._pricing_table = self._build_pricing()
+        # Per-user daily/monthly cost aggregates, written OUT OF BAND by a scheduled
+        # rollup Lambda that reads the ledger — deliberately NOT the interceptors, so the
+        # hot path stays lean. This is what lets the console look back beyond the 24h
+        # decision-record TTL and show daily/monthly spend per user.
+        self._cost_rollup_table = self._build_cost_rollup(self._cost_ledger)
         # ONE audit destination for BOTH interceptors. Created before them because each
         # function is pointed at it via the Lambda `logGroup` property.
         self._audit_log_group = self._build_audit_log_group()
@@ -142,8 +180,10 @@ class FoundationStack(Stack):
         # role, so Bedrock's own logs can never tell users apart).
         self._observability = self._build_observability(self._gateway)
 
-        # Admin console: API + static UI in one Lambda behind an HTTP API.
-        self._admin_fn, self._admin_api = self._build_admin_console(self._gateway)
+        # Admin console: JSON API on a Lambda behind an HTTP API, SPA on a private S3
+        # bucket, both fronted by one CloudFront distribution (path-routed).
+        (self._admin_fn, self._admin_api,
+         self._admin_distribution) = self._build_admin_console(self._gateway)
 
         # Governance features under test.
         #
@@ -156,7 +196,7 @@ class FoundationStack(Stack):
         #
         # Native limits attach only on RECOGNISED INFERENCE PATHS, so they never applied
         # to the bedrock-runtime passthrough target at all. That makes them a control
-        # that covers half the traffic while looking fully configured â€” and calling the
+        # that covers half the traffic while looking fully configured — and calling the
         # remainder "defense-in-depth" flattered it, because the depth existed on exactly
         # one surface. With the Bedrock surfaces converging on the runtime endpoint over
         # time, a mantle-only control is a dead end rather than a safety net.
@@ -165,12 +205,12 @@ class FoundationStack(Stack):
         # See _build_guardrail_interceptor_fn and docs/FINDINGS.md for the measured
         # gateway failure-mode matrix that makes that claim checkable.
         # Cedar owns exactly ONE question: may this caller use the gateway at all?
-        # Renamed from _build_model_access_policy, which it never was â€” Cedar cannot see
+        # Renamed from _build_model_access_policy, which it never was — Cedar cannot see
         # the requested model. Model entitlement is an interceptor control.
         self._group_access_policy = self._build_group_access_policy(
             self._policy_engine, self._gateway
         )
-        # GUARDRAIL-IN-POLICY (native) â€” DISABLED. Proven finding (see findings.md):
+        # GUARDRAIL-IN-POLICY (native) — DISABLED. Proven finding (see findings.md):
         # a provider target DOES surface the request body to context.input, but the
         # guardrail data-path argument requires a SCALAR STRING, and the Anthropic
         # Messages body has no flat string prompt field (the text is nested inside
@@ -189,7 +229,7 @@ class FoundationStack(Stack):
     def _build_gateway_role(self) -> iam.Role:
         """Execution role the gateway assumes to sign outbound Bedrock calls.
 
-        With JWT inbound auth, outbound uses GATEWAY_IAM_ROLE â€” every inference
+        With JWT inbound auth, outbound uses GATEWAY_IAM_ROLE — every inference
         call to Bedrock is signed by this role (that is why per-user attribution
         must come from the gateway layer, not Bedrock's logs).
         """
@@ -272,7 +312,7 @@ class FoundationStack(Stack):
                 resources=["*"],
             )
         )
-        # FINDING â€” ENVIRONMENT-DEPENDENT, granted defensively.
+        # FINDING — ENVIRONMENT-DEPENDENT, granted defensively.
         #
         # An account or organization can REQUIRE a guardrail on inference using the
         # `bedrock:GuardrailIdentifier` condition key (identity policy or SCP), which
@@ -283,12 +323,12 @@ class FoundationStack(Stack):
         #   403 not authorized to perform: bedrock:ApplyGuardrail on resource:
         #       arn:aws:bedrock:...:guardrail/<id>
         # for a guardrail this stack does not own, while mantle showed no such
-        # requirement â€” because a policy written against the runtime action names does
+        # requirement — because a policy written against the runtime action names does
         # not necessarily cover mantle's separate API surface.
         #
         # Do NOT generalise that split: which surface is affected depends entirely on
         # how the controlling policy is scoped, and another account may enforce on
-        # both, neither, or the opposite one. This grant is therefore unconditional â€”
+        # both, neither, or the opposite one. This grant is therefore unconditional —
         # a no-op where no such policy exists, and it prevents an opaque AccessDenied
         # where one does. Scoped to guardrails in THIS account rather than a specific
         # ARN, because which guardrail is mandated is not this stack's decision.
@@ -300,7 +340,7 @@ class FoundationStack(Stack):
                 resources=[
                     # Both resource types are needed, and they surface one at a time:
                     # granting only `guardrail/*` moved the denial on to
-                    # `guardrail-profile/us.guardrail.v1:0` â€” a CROSS-REGION guardrail
+                    # `guardrail-profile/us.guardrail.v1:0` — a CROSS-REGION guardrail
                     # profile, the same pattern as inference profiles. Not pinned to a
                     # single region for that reason.
                     f"arn:aws:bedrock:*:{config.AWS_ACCOUNT}:guardrail/*",
@@ -311,7 +351,7 @@ class FoundationStack(Stack):
         # The gateway invokes the REQUEST interceptor Lambda under THIS execution
         # role (identity-based), in addition to the Lambda's own resource policy.
         # The "Access denied while invoking Lambda" error names the gateway exec
-        # role explicitly â€” grant lambda:InvokeFunction on the interceptor.
+        # role explicitly — grant lambda:InvokeFunction on the interceptor.
         role.add_to_policy(
             iam.PolicyStatement(
                 sid="InvokeInterceptorLambda",
@@ -334,7 +374,7 @@ class FoundationStack(Stack):
         not a budget.
 
         The refresh Lambda is invoked ONCE on create as well as daily, because an empty
-        pricing table on a fresh deploy would silently fall back to the constants â€” the
+        pricing table on a fresh deploy would silently fall back to the constants — the
         exact failure mode this table exists to remove.
         """
         table = dynamodb.Table(
@@ -412,13 +452,95 @@ class FoundationStack(Stack):
         return table
 
     # ------------------------------------------------------------------ #
+    def _build_cost_rollup(self, ledger: dynamodb.Table) -> dynamodb.Table:
+        """Per-user daily/monthly cost aggregates + the Lambda that computes them.
+
+        DELIBERATELY OUT OF BAND. The two interceptors are on the request/response hot
+        path and must stay lean and fail closed — the request interceptor's own timeout
+        makes the GATEWAY fail open, so non-essential work there is a liability. Rolling
+        up cost history is non-essential to enforcement, so it runs here on a schedule,
+        reading what the interceptors already wrote and never touching their code path.
+
+        The aggregates outlive the `DECISION#` records they are derived from (24h TTL),
+        which is what lets the console look back weeks and show daily/monthly spend. The
+        job also harvests the `sub -> username` pairing (present on decision rows) into a
+        small map, so the console can label the sub-keyed live spend counters with names.
+        """
+        table = dynamodb.Table(
+            self,
+            "CostRollup",
+            table_name=config.COST_ROLLUP_TABLE_NAME,
+            partition_key=dynamodb.Attribute(
+                name="pk", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(name="sk", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="ttl",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        fn = _lambda.Function(
+            self,
+            "CostRollupFn",
+            function_name=f"{config.PREFIX}-cost-rollup",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="index.handler",
+            code=_lambda.Code.from_asset(_ROLLUP_LAMBDA_DIR),
+            # A single ledger scan; generous headroom for a large table.
+            timeout=Duration.minutes(2),
+            memory_size=256,
+            environment={
+                "COST_LEDGER_TABLE": ledger.table_name,
+                "COST_ROLLUP_TABLE": table.table_name,
+                "ROLLUP_TTL_SECONDS": str(config.COST_ROLLUP_TTL_SECONDS),
+            },
+            description=("Out-of-band cost rollup: per-user daily/monthly aggregates "
+                         "from the ledger. NOT on any request path."),
+        )
+        ledger.grant_read_data(fn)
+        table.grant_read_write_data(fn)
+
+        events.Rule(
+            self,
+            "CostRollupSchedule",
+            rule_name=f"{config.PREFIX}-cost-rollup",
+            schedule=events.Schedule.rate(
+                Duration.minutes(config.COST_ROLLUP_INTERVAL_MINUTES)
+            ),
+            targets=[events_targets.LambdaFunction(fn)],
+            description="Recompute per-user daily/monthly cost aggregates from the ledger.",
+        )
+
+        # Prime once on create so the console has aggregates immediately rather than
+        # waiting for the first scheduled run.
+        prime = cr.AwsCustomResource(
+            self,
+            "CostRollupOnCreate",
+            on_create=cr.AwsSdkCall(
+                service="Lambda",
+                action="invoke",
+                parameters={"FunctionName": fn.function_name,
+                            "InvocationType": "Event"},
+                physical_resource_id=cr.PhysicalResourceId.of("cost-rollup-prime"),
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                iam.PolicyStatement(effect=iam.Effect.ALLOW,
+                                    actions=["lambda:InvokeFunction"],
+                                    resources=[fn.function_arn])
+            ]),
+            install_latest_aws_sdk=False,
+        )
+        prime.node.add_dependency(fn)
+        return table
+
+    # ------------------------------------------------------------------ #
     def _build_audit_log_group(self) -> logs.LogGroup:
         """ONE searchable audit log for every governance decision, both stages.
 
         WHY THIS EXISTS
         ---------------
         A security reviewer needs one place to answer "who asked what, of which model,
-        and what did we do about it" â€” and none of the obvious candidates can:
+        and what did we do about it" — and none of the obvious candidates can:
 
           * **Bedrock invocation logging** is an account-level setting this stack does
             not own, mantle does not offer it, and it only records calls that REACH
@@ -427,7 +549,7 @@ class FoundationStack(Stack):
           * **Gateway OTEL spans** carry no identity and no token counts, and
             interceptor short-circuits are not spanned at all.
           * **The DynamoDB decision records** are the console's data source and carry a
-            24-hour TTL (`config.DECISION_RECORD_TTL_SECONDS`) â€” deliberately shorter
+            24-hour TTL (`config.DECISION_RECORD_TTL_SECONDS`) — deliberately shorter
             than this log, because they are operational state, not an archive. That TTL
             is also the console's history horizon, so it must not be shorter than the
             longest range the UI offers.
@@ -446,7 +568,7 @@ class FoundationStack(Stack):
         # MASK SENSITIVE DATA AT INGEST. This is what makes opting into prompt and
         # response logging defensible rather than reckless: a reader sees
         # `***MASKED***` unless they separately hold `logs:Unmask`. It is enabled even
-        # while content logging is off, because content is not the only leak path â€” a
+        # while content logging is off, because content is not the only leak path — a
         # guardrail assessment, an error string or a tool argument can carry an
         # identifier too.
         data_protection = None
@@ -480,7 +602,7 @@ class FoundationStack(Stack):
     def _build_usage_interceptor_fn(self, ledger: dynamodb.Table) -> _lambda.Function:
         """RESPONSE interceptor: output-token accounting.
 
-        Separate from the enforcement interceptor on purpose â€” different job, different
+        Separate from the enforcement interceptor on purpose — different job, different
         interception point, and keeping them apart means the enforcement path is
         unaffected by anything that happens here.
         """
@@ -514,7 +636,7 @@ class FoundationStack(Stack):
         # NOTE: the invoke permission is granted in the constructor AFTER the gateway
         # exists, so it can be scoped with source_arn to THIS gateway. Granting it here
         # would mean an unconstrained service principal (any AgentCore gateway, in any
-        # account, could invoke this function) â€” needlessly broad.
+        # account, could invoke this function) — needlessly broad.
         return fn
 
     # ------------------------------------------------------------------ #
@@ -528,7 +650,7 @@ class FoundationStack(Stack):
         """AgentCore Gateway with a Cognito CUSTOM_JWT inbound authorizer.
 
         Path A: the authorizer validates issuer (via Cognito discovery URL) and
-        audience (the app client id â€” Cognito access tokens set `aud`/`client_id`
+        audience (the app client id — Cognito access tokens set `aud`/`client_id`
         to the app client id). We do NOT set allowed_scopes: InitiateAuth access
         tokens carry no custom scope. Authorization (which group may use which
         model) is enforced by Cedar keyed on `cognito:groups`.
@@ -536,7 +658,7 @@ class FoundationStack(Stack):
         discovery_url = config.cognito_discovery_url(
             config.AWS_REGION, self._cognito.user_pool.user_pool_id
         )
-        # Cognito ACCESS tokens have no `aud` claim â€” the client identity is in
+        # Cognito ACCESS tokens have no `aud` claim — the client identity is in
         # `client_id`, validated by allowed_clients. Setting allowed_audience
         # would require an `aud` match that never succeeds (403 insufficient_scope
         # / invalid_token). So use allowed_clients ONLY for Cognito.
@@ -558,7 +680,7 @@ class FoundationStack(Stack):
         # REQUEST interceptor: enforcement (model access, cost budget, guardrail).
         # Inference targets share the HTTP interceptor payload (base64 body).
         # pass_request_headers=True gives it the inbound JWT, which is how it knows
-        # WHO is calling â€” the basis of every per-principal decision.
+        # WHO is calling — the basis of every per-principal decision.
         interceptor_cfgs = [
             agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(
                 interception_points=["REQUEST"],
@@ -575,7 +697,7 @@ class FoundationStack(Stack):
 
         # RESPONSE interceptor: output-token accounting, as a SEPARATE Lambda so the
         # enforcement path stays untouched. Only the response carries
-        # `usage.output_tokens`, and output tokens dominate real spend â€” a prompt-only
+        # `usage.output_tokens`, and output tokens dominate real spend — a prompt-only
         # ledger understates cost.
         #
         # TRADE-OFF, accepted deliberately: response interception on HTTP/inference
@@ -625,7 +747,7 @@ class FoundationStack(Stack):
         """Single Bedrock inference connector target.
 
         The only valid connector IDs are `bedrock-mantle`, `openai`, `anthropic`
-        (verified against the control-API reference â€” there is NO `bedrock-runtime`
+        (verified against the control-API reference — there is NO `bedrock-runtime`
         connector). `bedrock-mantle` IS the Bedrock connector. Bedrock connectors
         use GATEWAY_IAM_ROLE outbound with no iamCredentialProvider sub-object
         (the service is already known to the gateway).
@@ -665,7 +787,7 @@ class FoundationStack(Stack):
         / `.body` are "not present" for the guardrail policy. A provider target
         declares operations/paths/models explicitly. This experiment tests
         whether that explicit declaration surfaces request content to the
-        guardrail â€” the open question blocking the guardrail goal.
+        guardrail — the open question blocking the guardrail goal.
 
         Shape (introspected on 2.268.0):
           InferenceProviderTargetConfigurationProperty(endpoint, model_mapping, operations)
@@ -735,7 +857,7 @@ class FoundationStack(Stack):
         -----------------------------------------------------------
         Fronting runtime with an *inference* target does not work today. Verified,
         in order:
-          1. There is **no `bedrock-runtime` connector** â€” valid connector IDs are
+          1. There is **no `bedrock-runtime` connector** — valid connector IDs are
              only `bedrock-mantle`, `openai`, `anthropic`.
           2. An inference **provider** target aimed at
              `https://bedrock-runtime.us-east-1.amazonaws.com` reaches runtime and
@@ -754,7 +876,7 @@ class FoundationStack(Stack):
                   IamCredentialProvider."
           4. Pointing at the control-plane host `bedrock.us-east-1.amazonaws.com`
              (which *would* derive the right signing service) returns
-             `UnknownOperationException` â€” it does not serve the invoke API.
+             `UnknownOperationException` — it does not serve the invoke API.
 
         A **passthrough** target with `protocolType=INFERENCE` is therefore the only
         route: it is one of the target types permitted to set an explicit signing
@@ -842,7 +964,7 @@ class FoundationStack(Stack):
         """Per-user spend ledger, keyed by user + time window.
 
         WHY A LEDGER IS REQUIRED (not a nice-to-have):
-          * Native token rate limits meter **input tokens only** â€” output tokens,
+          * Native token rate limits meter **input tokens only** — output tokens,
             which dominate real spend, are never counted. So they cap prompt
             volume, not cost.
           * They also only apply on known inference paths, so they do **nothing**
@@ -881,7 +1003,7 @@ class FoundationStack(Stack):
         RESOLUTION PRECEDENCE (most specific wins, evaluated per kind):
             USER#<username>  ->  GROUP#<group>  ->  DEFAULT
 
-        SHAPE (single table, scope + kind) â€” plus one operational row:
+        SHAPE (single table, scope + kind) — plus one operational row:
             pk = "DEFAULT", sk = "BREAKGLASS"
 
         Attributes by kind:
@@ -893,7 +1015,7 @@ class FoundationStack(Stack):
 
         Seeding is **onCreate only, deliberately**. A redeploy must NOT clobber
         changes an administrator made at runtime. The consequence is that changing
-        a seed value in code has no effect on an existing table â€” edit through the
+        a seed value in code has no effect on an existing table — edit through the
         admin API instead, which is the intended path.
         """
         table = dynamodb.Table(
@@ -928,17 +1050,21 @@ class FoundationStack(Stack):
             # property of group membership, not of a claim baked into the token.
             _put("DEFAULT", "MODELS",
                  allow=_globs(["*"]), deny=_globs(["*claude-opus*"])),
+            # Dual calendar budgets: independent daily + monthly caps, EITHER can deny.
+            # (Replaces the single fixed-window budget. The interceptor still honours a
+            # legacy `budget_usd`/`window_seconds` row for backward compatibility, but new
+            # deployments seed the calendar form.)
             _put(
                 "DEFAULT",
                 "BUDGET",
-                budget_usd={"N": str(config.DEMO_COST_BUDGET_USD)},
-                window_seconds={"N": str(config.DEMO_COST_WINDOW_SECONDS)},
+                daily_budget_usd={"N": str(config.DEMO_COST_DAILY_BUDGET_USD)},
+                monthly_budget_usd={"N": str(config.DEMO_COST_MONTHLY_BUDGET_USD)},
             ),
             # The VERSION is seeded alongside the id because the two are a pair: the same
             # id serves a mutable DRAFT and any number of published versions carrying
             # different content policies. The interceptor previously took the version
             # from an env var, which stopped being coherent once the admin console could
-            # bind any guardrail in the account â€” the id came from policy while the
+            # bind any guardrail in the account — the id came from policy while the
             # version came from this stack's own guardrail. See `_apply_guardrail`.
             _put(
                 "DEFAULT",
@@ -985,7 +1111,7 @@ class FoundationStack(Stack):
             # ---- BREAK GLASS: seeded OFF, and it must stay that way -----------
             # The interceptor is fail closed, which means an interceptor bug is a total
             # inference outage. That is only an acceptable trade if recovery is faster
-            # than shipping code â€” so an administrator can flip this row and bypass
+            # than shipping code — so an administrator can flip this row and bypass
             # enforcement within the config cache TTL (~10s), no deployment.
             #
             # The row is SEEDED so its existence and shape are discoverable rather than
@@ -1005,7 +1131,7 @@ class FoundationStack(Stack):
         seed = cr.AwsCustomResource(
             self,
             "GovernanceConfigSeed",
-            # onCreate ONLY â€” see docstring. No on_update, so redeploys are safe.
+            # onCreate ONLY — see docstring. No on_update, so redeploys are safe.
             on_create=cr.AwsSdkCall(
                 service="DynamoDB",
                 action="batchWriteItem",
@@ -1048,7 +1174,7 @@ class FoundationStack(Stack):
             # HEADROOM, NOT A DEADLINE. Measured: when this function TIMES OUT the
             # gateway returns 200 and the model is invoked ungoverned (whereas an
             # unhandled exception fails closed with 400). So the function must never
-            # actually reach its timeout â€” it enforces its OWN budget internally and
+            # actually reach its timeout — it enforces its OWN budget internally and
             # denies with 403 while it still has time to answer.
             #
             # This value therefore only has to be comfortably larger than the worst
@@ -1141,7 +1267,7 @@ class FoundationStack(Stack):
         WHY THIS MATTERS: the gateway signs every Bedrock call with ONE shared
         execution role, so Bedrock's own logs / CloudTrail can never distinguish
         end users. Per-user attribution has to come from the GATEWAY layer, which
-        means gateway spans. Without this, there is no usage telemetry at all â€”
+        means gateway spans. Without this, there is no usage telemetry at all —
         which is also why `qualifiedModelId` had to be discovered by trial.
 
         Two layers are required and only the second is in this stack:
@@ -1150,7 +1276,7 @@ class FoundationStack(Stack):
            segment destination = CloudWatchLogs, plus a logs resource policy letting
            xray.amazonaws.com PutLogEvents to `aws/spans`). It is an account-wide
            setting with its own ingestion cost, so it is deliberately NOT created
-           here â€” flipping a shared account setting from a demo stack would be
+           here — flipping a shared account setting from a demo stack would be
            rude. Enable it once per account:
                aws xray update-trace-segment-destination --destination CloudWatchLogs
            (console: CloudWatch > Application Signals > Transaction search).
@@ -1199,7 +1325,7 @@ class FoundationStack(Stack):
             delivery_destination_type="CWL",
             destination_resource_arn=log_group.log_group_arn,
         )
-        # XRAY destination takes NO destination_resource_arn â€” spans are routed to
+        # XRAY destination takes NO destination_resource_arn — spans are routed to
         # the account's span store (surfacing in the `aws/spans` log group because
         # Transaction Search sends trace segments to CloudWatch Logs).
         traces_destination = logs.CfnDeliveryDestination(
@@ -1238,19 +1364,28 @@ class FoundationStack(Stack):
 
     # ------------------------------------------------------------------ #
     def _build_admin_console(self, gateway: agentcore.CfnGateway):
-        """Governance admin console â€” one Lambda serving both the API and the UI,
-        behind an **API Gateway HTTP API**.
+        """Governance admin console, fronted by CloudFront.
 
-        Deliberately minimal infrastructure: a single-file SPA plus a small JSON API
-        from one function. No S3 bucket, no CloudFront, no build step. For a
-        demonstration that keeps the moving parts visible that is the right trade; for
-        production you would front it with CloudFront + WAF.
+        Topology: ONE CloudFront distribution, two origins, path-routed.
+          * `/`        → a PRIVATE S3 bucket holding the single-file SPA (OAC-locked,
+                         no public access), served as a static object.
+          * `/api/*`   → this Lambda behind an **API Gateway HTTP API** (the JSON API).
 
-        SECURITY POSTURE â€” stated plainly because it matters:
+        Because the UI and the API answer on the SAME origin, there is no cross-origin
+        request to permit and CORS is gone entirely (both the HTTP API preflight and the
+        Lambda's `Access-Control-*` headers were removed). A `web_acl_id` can be attached
+        to the distribution later to put WAF in front of the whole console.
+
+        This replaces the earlier "one Lambda serves both the API and the HTML" design.
+        Serving a UI by executing a Lambda is not a shape a customer would ship, and
+        keeping the SPA and API on one Lambda forced the permissive CORS `*`. See
+        `_build_admin_cdn` for the distribution.
+
+        SECURITY POSTURE — stated plainly because it matters:
         the function is **NOT publicly invokable**. A Lambda Function URL was the first
         design and was removed: `authType=NONE` requires a resource policy with
         `Principal: "*"`, which made this function world-accessible and was flagged by
-        account security tooling. (It also never worked here â€” an organization guardrail
+        account security tooling. (It also never worked here — an organization guardrail
         rejects unauthenticated Function URLs regardless of the resource policy.) The
         public surface is API Gateway; `pilot/guards.py` fails the synth if that ever
         regresses.
@@ -1263,7 +1398,7 @@ class FoundationStack(Stack):
         admin group. The UI shell is public; no data is readable or writable without an
         admin token.
 
-        This console is PRIVILEGED â€” it can widen model access and raise spend caps â€”
+        This console is PRIVILEGED — it can widen model access and raise spend caps —
         so every mutation is logged with the acting admin. NOTE: those mutation records
         go to THIS function's own log group, not the shared governance audit log that
         the two interceptors write to. See docs/ADMIN-CONSOLE.md.
@@ -1293,6 +1428,14 @@ class FoundationStack(Stack):
                 "AUDIT_LOG_RETENTION_DAYS": str(config.audit_log_retention_days()),
                 # Pricing table: model rates, for display.
                 "PRICING_TABLE": self._pricing_table.table_name,
+                # Per-user daily/monthly cost aggregates (out-of-band rollup) + the
+                # sub->username map, so the console can look back past the 24h decision
+                # TTL and label the live spend counters with names.
+                "COST_ROLLUP_TABLE": self._cost_rollup_table.table_name,
+                # The gateway's own URL, available to the console for display/links. (The
+                # mantle catalog is fetched directly from the mantle service endpoint via
+                # SigV4, not through the gateway — see _catalog / _mantle_models.)
+                "GATEWAY_URL": gateway.attr_gateway_url,
                 # The canonical model ids a MODELS glob is matched against, on BOTH
                 # surfaces. Deliberately NOT derived from the pricing table: those keys
                 # are normalized with punctuation stripped (`claudeopus5`), so evaluating
@@ -1315,17 +1458,36 @@ class FoundationStack(Stack):
 
         # Policy data: read AND write (this is the console's whole purpose).
         self._config_table.grant_read_write_data(fn)
-        # Spend ledger: read only â€” the console reports spend, it does not adjust it.
+        # Spend ledger: read only — the console reports spend, it does not adjust it.
         self._cost_ledger.grant_read_data(fn)
 
         # Model inventory for the model picker and the effective-access preview. The
         # pricing table already holds one row per model this deployment can price, so it
         # doubles as the list of models it can govern.
         self._pricing_table.grant_read_data(fn)
+        # Cost rollup: per-user daily/monthly aggregates + the sub->username map.
+        self._cost_rollup_table.grant_read_data(fn)
+        # Live Bedrock model catalog for the pickers, from BOTH surfaces:
+        #   * runtime — bedrock:ListInferenceProfiles (+ ListFoundationModels fallback).
+        #   * mantle  — a SigV4-signed GET to bedrock-mantle.<region>.api.aws/v1/models.
+        #     Mantle is a DISTINCT IAM service namespace (`bedrock-mantle:*`); the gateway
+        #     role gets it via the AmazonBedrockMantleInferenceAccess managed policy. The
+        #     console needs only the list call, granted narrowly here. None of these
+        #     actions are resource-scopable.
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="ReadBedrockModelCatalog",
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock:ListFoundationModels",
+                         "bedrock:ListInferenceProfiles",
+                         "bedrock-mantle:ListModels"],
+                resources=["*"],
+            )
+        )
 
         # Group membership for authorization, PLUS the identity pickers. A free-text
         # scope box accepts `GROUP#ml-reserch` and produces a rule that silently never
-        # matches, which is the worst kind of governance bug â€” the console displays
+        # matches, which is the worst kind of governance bug — the console displays
         # policy that does not exist. Listing real users and groups removes the class.
         fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -1365,10 +1527,10 @@ class FoundationStack(Stack):
 
         # FINDING: a Lambda **Function URL** was the first choice (fewest moving
         # parts) but does not work in this account. With `authType=NONE` and a
-        # textbook-correct resource policy in place â€”
+        # textbook-correct resource policy in place —
         #   Principal "*", Action lambda:InvokeFunctionUrl,
         #   Condition lambda:FunctionUrlAuthType = NONE
-        # â€” every request, including the plain UI shell, still returned
+        # — every request, including the plain UI shell, still returned
         #   403 {"Message":"Forbidden. For troubleshooting Function URL authorization..."}
         # i.e. rejected by the Function URL auth layer before our code ran. Since the
         # policy was provably correct, the cause is almost certainly an
@@ -1384,19 +1546,114 @@ class FoundationStack(Stack):
         # Lambda, which validates the Cognito ACCESS token via GetUser and then checks
         # admin-group membership. Cognito access tokens carry no `aud` claim (a finding
         # from earlier in this pilot), which makes them awkward for the built-in JWT
-        # authorizer â€” and doing it in code keeps the group check in one place.
+        # authorizer — and doing it in code keeps the group check in one place.
+        #
+        # NO CORS on the HTTP API. The SPA and this API are served from the SAME
+        # CloudFront distribution (below), so every /api/* call is same-origin. The
+        # previous `allow_origins=["*"]` preflight was a gap, not a requirement, and is
+        # removed with it.
         api = apigw.HttpApi(
             self,
             "AdminConsoleApi",
             api_name=f"{config.PREFIX}-admin-console",
-            cors_preflight=apigw.CorsPreflightOptions(
-                allow_origins=["*"],
-                allow_methods=[apigw.CorsHttpMethod.ANY],
-                allow_headers=["Authorization", "Content-Type"],
-            ),
             default_integration=apigw_int.HttpLambdaIntegration("AdminIntegration", fn),
         )
-        return fn, api
+
+        distribution = self._build_admin_cdn(api)
+        return fn, api, distribution
+
+    # ------------------------------------------------------------------ #
+    def _build_admin_cdn(self, api: apigw.HttpApi) -> cloudfront.Distribution:
+        """Serve the console from CloudFront: SPA from a PRIVATE S3 bucket, JSON API
+        from the HTTP API — both on ONE distribution, path-routed.
+
+        This is the production shape the earlier single-Lambda design deferred. It buys
+        three things at once:
+
+          * the SPA is a static object in a private bucket (locked to CloudFront via an
+            Origin Access Control), so the UI is no longer served by executing a Lambda;
+          * the API and the UI share one origin, which is why CORS could be deleted
+            outright rather than narrowed;
+          * a `web_acl_id` can be attached to this distribution later to put WAF in
+            front of the whole console — no code change beyond that one property.
+
+        The public surface is CloudFront, never the Lambda — which is the rule
+        `pilot/guards.py` exists to enforce. No Lambda Function URL is introduced, so
+        that guard is unaffected.
+        """
+        # Private bucket for the single-page app. No public access; CloudFront reaches
+        # it through an Origin Access Control (OAC), so the only path to these objects
+        # is the distribution.
+        ui_bucket = s3.Bucket(
+            self,
+            "AdminConsoleUiBucket",
+            bucket_name=f"{config.PREFIX}-admin-console-ui-{self.account}",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,   # demo stack: tears down cleanly
+            auto_delete_objects=True,
+        )
+
+        # The SPA is the SAME single-file HTML the Lambda used to serve, now shipped as
+        # a static object. It is fully self-contained and origin-agnostic: it reads
+        # region + Cognito client id from GET /api/meta at load time (there is no
+        # server-side templating step any more). Sourced straight from the handler
+        # module's `_UI_HTML` constant so there is exactly one copy of the UI.
+        ui_html = _load_admin_ui_html()
+        s3_deployment.BucketDeployment(
+            self,
+            "AdminConsoleUiDeployment",
+            destination_bucket=ui_bucket,
+            sources=[s3_deployment.Source.data("index.html", ui_html)],
+            # index.html must not be cached hard, so a redeploy of the UI is visible
+            # without a manual invalidation; the SPA itself pulls fresh /api data.
+            cache_control=[
+                s3_deployment.CacheControl.set_public(),
+                s3_deployment.CacheControl.max_age(Duration.seconds(60)),
+            ],
+        )
+
+        # The HTTP API endpoint is a full URL (https://<id>.execute-api.<region>...);
+        # an HttpOrigin wants the bare domain, so strip the scheme.
+        api_domain = Fn.select(2, Fn.split("/", api.api_endpoint))
+
+        distribution = cloudfront.Distribution(
+            self,
+            "AdminConsoleDistribution",
+            comment=f"{config.PREFIX} governance admin console",
+            default_root_object="index.html",
+            # Default behaviour: the SPA, from the private S3 bucket via OAC.
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
+                    ui_bucket
+                ),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+            ),
+            additional_behaviors={
+                # The JSON API, from the HTTP API origin. Nothing here is cacheable
+                # (every response is per-request, token-authorized), and the viewer's
+                # Authorization header MUST reach the origin — ALL_VIEWER_EXCEPT_HOST_HEADER
+                # forwards headers/query/cookies but drops Host, which an HttpOrigin
+                # requires so it presents the API Gateway's own host.
+                "/api/*": cloudfront.BehaviorOptions(
+                    origin=cloudfront_origins.HttpOrigin(api_domain),
+                    viewer_protocol_policy=(
+                        cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
+                    ),
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=(
+                        cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER
+                    ),
+                ),
+            },
+            # web_acl_id intentionally unset. A WAF web ACL (CfnWebACL, scope=CLOUDFRONT,
+            # created in us-east-1) can be attached here later without any other change.
+        )
+        return distribution
 
     # ------------------------------------------------------------------ #
     def _build_policy_engine(self) -> agentcore.CfnPolicyEngine:
@@ -1412,7 +1669,7 @@ class FoundationStack(Stack):
     # ------------------------------------------------------------------ #
     # DELETED: _build_rate_limit (native per-user TPM on $.context.jwt.sub).
     #
-    # It worked, and it is still worth knowing it exists â€” but it could not be part of a
+    # It worked, and it is still worth knowing it exists — but it could not be part of a
     # cross-surface governance plane:
     #
     #   * it attaches only on recognised inference paths, so the bedrock-runtime
@@ -1431,7 +1688,7 @@ class FoundationStack(Stack):
         """Cedar policy: may this caller use the gateway AT ALL? One boolean.
 
         SCOPE, stated precisely because it is easy to overestimate. Cedar governs
-        exactly one question here â€” membership of the platform group â€” and nothing
+        exactly one question here — membership of the platform group — and nothing
         else. It does NOT govern which model you may use, how fast, or how much you
         may spend. Those are interceptor controls reading the config table.
 
@@ -1441,7 +1698,7 @@ class FoundationStack(Stack):
         no invocation budget. Given that a REQUEST-interceptor TIMEOUT was measured to
         fail OPEN at the gateway (see docs/FINDINGS.md), an independent check that
         cannot time out is worth more, not less. And unlike the native rate limits that
-        were deleted, this one applies on BOTH surfaces â€” verified: a non-member gets
+        were deleted, this one applies on BOTH surfaces — verified: a non-member gets
         403 on mantle and on the runtime passthrough.
 
         So the division of labour is: Cedar answers "are you allowed in", cheaply and
@@ -1468,7 +1725,7 @@ class FoundationStack(Stack):
         # (the specific gateway ARN, not the AgentCore::Gateway type).
         gw_arn = gateway.attr_gateway_arn
         # FINDING: for an INFERENCE target, the Cedar action IS the target name
-        # itself ("bedrock") â€” not TargetName___op. (MCP targets use
+        # itself ("bedrock") — not TargetName___op. (MCP targets use
         # Target___tool per tool; inference targets expose a single action = the
         # target.) The schema error explicitly said: did you mean
         # AgentCore::Action::"bedrock"?
@@ -1477,7 +1734,7 @@ class FoundationStack(Stack):
         # the engine's "Overly Restrictive" guard because principal types without
         # a cognito:groups tag (IamEntity, unauthenticated) would be denied
         # unconditionally. Forbidding only the standard group is well-scoped.
-        # FINDING: once ANY policy exists, the engine is DENY-BY-DEFAULT â€” an
+        # FINDING: once ANY policy exists, the engine is DENY-BY-DEFAULT — an
         # explicit `permit` is required to allow. (With no policy it permits;
         # verified.) So the policy set is: PERMIT OAuthUsers to invoke bedrock,
         # then FORBID the standard group. Cedar `forbid` overrides `permit`, so
@@ -1504,7 +1761,7 @@ class FoundationStack(Stack):
         # the tag is missing entirely) -> carol (no group) is denied entry; alice and bob
         # pass and go on to be governed by the interceptor.
         #
-        # âš ï¸ KNOWN WEAKNESS â€” SUBSTRING MATCHING. `cognito:groups` is multi-valued and
+        # ⚠️ KNOWN WEAKNESS — SUBSTRING MATCHING. `cognito:groups` is multi-valued and
         # Cedar renders it as an opaque scalar, so `==` and `.contains` both proved
         # unreliable against it and this settled on a `like` wildcard. The consequence is
         # that the test is a SUBSTRING match, not set membership: a group named
@@ -1512,7 +1769,7 @@ class FoundationStack(Stack):
         # `like "*ai-platform*"` and be admitted.
         #
         # Risk is negligible with three demo groups whose names we control, and the blast
-        # radius is bounded â€” passing this check only gets you to the interceptor, which
+        # radius is bounded — passing this check only gets you to the interceptor, which
         # still decides models, rate and spend. But it is a real authorization defect and
         # must not be copied into an environment with a large or externally-managed group
         # directory. Tightening it means either finding a reliable exact-match form
@@ -1546,7 +1803,7 @@ class FoundationStack(Stack):
         permit_policy.add_dependency(gateway)
 
         # NAME AND DESCRIPTION CORRECTED. This was `acgw_pilot_model_access`, described as
-        # forbidding "the standard cognito group" â€” both wrong, and misleading in exactly
+        # forbidding "the standard cognito group" — both wrong, and misleading in exactly
         # the place it matters, because the policy name is what the console shows.
         #
         #   * it governs GROUP MEMBERSHIP, not model access. Per-model entitlement is an
@@ -1586,7 +1843,7 @@ class FoundationStack(Stack):
 
         Confirmed by docs: guardrails run on HTTP INFERENCE targets (POST /inference).
         The BedrockGuardrails:: functions are built-in (call InvokeGuardrailChecks via
-        the gateway role's FAS creds) â€” no provisioned Guardrail resource needed.
+        the gateway role's FAS creds) — no provisioned Guardrail resource needed.
 
         This forbids inference when a PROMPT_ATTACK (prompt injection) is detected
         in the request content. The `when guardrails {}` block replaces standard
@@ -1601,7 +1858,7 @@ class FoundationStack(Stack):
         # Scope the action to the PROVIDER inference target ("bedrockprov").
         # EXPERIMENT: the connector target ("bedrock") declares no input schema,
         # so context.input.prompt/.body were "not present". A provider target
-        # declares operations/paths/models explicitly â€” this tests whether that
+        # declares operations/paths/models explicitly — this tests whether that
         # surfaces the request content to the guardrail. Constraining action
         # requires a concrete resource (the gateway ARN), same as model-access.
         # KEY CORRECTION (from the guardrails-in-policies doc + the deploy error):
@@ -1612,12 +1869,12 @@ class FoundationStack(Stack):
         #  2. context.input fields are the OPERATION's request-body fields (per the
         #     Memory FGAC doc: context.input = path params + body fields from the
         #     operation schema). For the Anthropic Messages op (/v1/messages) the
-        #     body's top-level field is `messages` â€” not `prompt`/`body`. The doc's
+        #     body's top-level field is `messages` — not `prompt`/`body`. The doc's
         #     dataPath examples are context.input.message / context.input.systemPrompt.
         # So scope to bedrockprov___POST:/v1/messages and reference a STRING body field.
         #
         # BREAKTHROUGH (empirical, deploy #2): context.input.messages RESOLVED on
-        # this provider action (typed `Set<record>`) â€” i.e. the provider target DOES
+        # this provider action (typed `Set<record>`) — i.e. the provider target DOES
         # surface the request body to the guardrail context (the connector did not).
         # The remaining constraint: PromptAttack takes a scalar `string`, but
         # `messages` is an array of records. So we must reference a STRING-typed
@@ -1644,7 +1901,7 @@ class FoundationStack(Stack):
             name="acgw_pilot_guardrail",
             definition=agentcore.CfnPolicy.PolicyDefinitionProperty(
                 # The `policy` field (not `cedar`) accepts the AgentCore policy
-                # superset â€” Cedar + temporal + `when guardrails {}`. The plain
+                # superset — Cedar + temporal + `when guardrails {}`. The plain
                 # `cedar` field rejects the `guardrails` token.
                 policy=agentcore.CfnPolicy.PolicyStatementProperty(statement=cedar),
             ),
@@ -1681,7 +1938,7 @@ class FoundationStack(Stack):
         # Stable, stack-level Cognito outputs so clients can auto-discover the pool
         # and app client after ANY deploy. (The CognitoIdentity construct also emits
         # its own outputs, but nested-construct output keys carry a generated hash
-        # suffix â€” e.g. Cognito2UserPoolIdB2475321 â€” which is not safe to look up
+        # suffix — e.g. Cognito2UserPoolIdB2475321 — which is not safe to look up
         # by name. These two keys are fixed.)
         CfnOutput(
             self,
@@ -1704,8 +1961,9 @@ class FoundationStack(Stack):
         CfnOutput(
             self,
             "AdminConsoleUrl",
-            value=self._admin_api.api_endpoint,
-            description="Governance admin console. Sign in with the gateway-admins user.",
+            value=f"https://{self._admin_distribution.distribution_domain_name}",
+            description=("Governance admin console (CloudFront). Sign in with the "
+                         "gateway-admins user."),
         )
         CfnOutput(
             self,
@@ -1726,4 +1984,11 @@ class FoundationStack(Stack):
             "GovernanceConfigTable",
             value=self._config_table.table_name,
             description="DynamoDB table holding governance policy data (runtime state).",
+        )
+        CfnOutput(
+            self,
+            "CostRollupTable",
+            value=self._cost_rollup_table.table_name,
+            description=("Per-user daily/monthly cost aggregates, written out-of-band by "
+                         "the cost-rollup Lambda (not the interceptors)."),
         )

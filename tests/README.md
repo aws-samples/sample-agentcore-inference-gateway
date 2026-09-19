@@ -53,9 +53,11 @@ worst of all `cost_budget_exceeded`, which charged you a second time for being t
 over budget.
 
 The arithmetic half is ordinary: with a stubbed DynamoDB client, `_refund_reservation` must
-write the exact negative of the charge, to the same window counter, using `ADD`, and must write
-nothing at all when the reservation is incomplete (a missing `sub` or `bucket` would credit the
-wrong counter).
+write the exact negative of the charge to **both** calendar counters the reservation went to
+(daily `<sub>#D#YYYYMMDD` and monthly `<sub>#M#YYYYMM`), using `ADD`, and must write nothing
+for a counter whose key the reservation does not carry (guessing a key would credit the wrong
+counter). Symmetry is load-bearing: an asymmetric add/subtract drives one counter negative, and
+a negative total silently disables its cap.
 
 The **structural** half is the one that matters. It parses the interceptor with `ast` and fails
 if any `return` in `_govern` after the reservation does not funnel through `_finish`. A
@@ -91,23 +93,32 @@ Costs a few cents of real inference and writes real audit records.
 ## `verify_cost_symmetry_live.py` — live, needs a deployed stack
 
 The end-to-end half of `test_cost_symmetry.py`: it drives each denial path against the deployed
-gateway and asserts the caller's window counter is **unchanged**, reading the ledger row
-`<sub>#<bucket>` directly. That row is what enforcement reads, so it is the thing that has to be
-right; a `refunded: true` log line would only prove we logged it.
+gateway and asserts the caller's **daily and monthly** spend counters are both unchanged,
+reading the ledger rows `<sub>#D#YYYYMMDD` and `<sub>#M#YYYYMM` directly. Those rows are what
+enforcement reads, so they are the thing that has to be right; a `refunded: true` log line would
+only prove we logged it.
 
-Four scenarios, ordered by how late the denial lands — model entitlement (before the
-reservation), guardrail (after it), cost budget (the worst case), and Cedar (after the request
-interceptor has already returned ALLOW, so only the RESPONSE interceptor can reverse it). Then
-it scans for unsettled `PENDING#` rows: such a row means "in flight", so one that outlives its
-request is a reservation nobody settled.
+Five scenarios. A baseline allowed request first, which must move the day and month counters by
+the **same** amount (the direct test of the symmetry hazard above), then the denials ordered by
+how late they land — model entitlement (before the reservation), guardrail (after it), cost
+budget (the worst case), and Cedar (after the request interceptor has already returned ALLOW, so
+only the RESPONSE interceptor can reverse it). Then it scans for unsettled `PENDING#` rows: such
+a row means "in flight", so one that outlives its request is a reservation nobody settled.
+
+The entitlement and budget scenarios each install a temporary `USER#bob` config row to force
+the denial and restore whatever was there afterwards. They do not assume the deployed rows will
+deny: resolution is first match per kind with no merge, so a permissive `GROUP#` row saved from
+the console out-ranks a `DEFAULT` deny for its members — documented behaviour that once made
+this scenario report a `200` and look like a bypass.
 
 ```powershell
+$env:ACGW_DEMO_PASSWORD = "<the DemoUserPassword stack output>"
 .\.venv\Scripts\python.exe tests\verify_cost_symmetry_live.py
 ```
 
-⚠️ **Read `SKIPPED` as "not proven", not as "fine".** The ledger counter is a fixed 60-second
-window bucket, so a scenario is only measurable if its before and after reads land in the same
-bucket. Each one waits for a fresh bucket and reports `SKIPPED (window rolled)` rather than
-silently comparing two different counters — which would read as a clean PASS.
+⚠️ **Read `SKIPPED` as "not proven", not as "fine".** A scenario is only measurable if its
+before and after reads land in the same UTC day; each one refuses to start in the last minute
+of the day and reports `SKIPPED (UTC day rolled)` rather than silently comparing two different
+counters — which would read as a clean PASS.
 
-Takes a few minutes, mostly spent waiting on window boundaries.
+Takes a couple of minutes, mostly the interceptor's config-cache TTL and settle waits.

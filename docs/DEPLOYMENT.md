@@ -107,8 +107,11 @@ npx cdk deploy AcgwPilotFoundationStack --require-approval never
 
 About 5–8 minutes. It creates one stack containing roughly 60 resources: the gateway and its
 execution role, three inference/passthrough targets, a Cognito user pool with demo users, a
-Cedar policy engine and policies, a Bedrock guardrail, two DynamoDB tables, three Lambdas, the
-admin console API, and vended log delivery.
+Cedar policy engine and policies, a Bedrock guardrail, four DynamoDB tables (governance
+config, cost ledger, model pricing, cost rollup), five Lambdas (two interceptors, admin API,
+pricing sync, cost rollup), the admin console (CloudFront + private S3 + API Gateway), two
+EventBridge schedules, and vended log delivery. Around 90 resources in total, including the
+CDK-managed helpers for the S3 deployment.
 
 Everything is named `acgw-pilot-*`. If you already run other AgentCore gateways in the account,
 check for collisions first with `aws bedrock-agentcore-control list-gateways`.
@@ -124,8 +127,9 @@ aws cloudformation describe-stacks --stack-name AcgwPilotFoundationStack `
 |---|---|
 | `GatewayUrl` | base inference URL; clients use `<GatewayUrl>/inference/v1` |
 | `UserPoolId`, `UserPoolClientId` | Cognito login |
-| `AdminConsoleUrl` | governance console |
+| `AdminConsoleUrl` | governance console (the CloudFront domain) |
 | `GovernanceConfigTable` | policy table the interceptor reads |
+| `ModelPricingTable`, `CostRollupTable` | live prices; per-user daily/monthly cost history |
 | `AuditLogGroupName` | the single governance audit log (see below) |
 | `GuardrailId`, `GatewayLogGroupName` | guardrail and gateway logs |
 
@@ -273,8 +277,9 @@ The DynamoDB decision records, by contrast, TTL out after 24 hours (`DECISION_RE
 npx cdk destroy AcgwPilotFoundationStack
 ```
 
-The user pool, both DynamoDB tables and the audit log group are destroyed with the stack —
-deliberately, so a demo leaves nothing behind. If you want the audit trail to outlive the stack
+The user pool, all four DynamoDB tables (including the cost-rollup history), the console's S3
+bucket and the audit log group are destroyed with the stack — deliberately, so a demo leaves
+nothing behind. If you want the audit trail to outlive the stack
 (a reasonable choice for a real deployment), change the audit log group's removal policy to
 `RETAIN` in `pilot/foundation_stack.py`. Gateway and vended log groups may also survive; delete
 them separately. Delete the stack when you are done; the gateway, Lambdas, tables, Cognito and

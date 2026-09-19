@@ -269,11 +269,11 @@
     <text class="t-mono" x="318" y="633" style="font-size:8px">MODELS|RATELIMIT|BUDGET|GUARDRAIL</text>
 
     <rect class="bx" x="509" y="552" width="195" height="94" rx="7"/>
-    <text class="t-ttl-sm" x="521" y="573">cost-ledger</text>
-    <text class="t-sub" x="521" y="589">four kinds in one table:</text>
+    <text class="t-ttl-sm" x="521" y="573">cost-ledger + cost-rollup</text>
+    <text class="t-sub" x="521" y="589">kinds in one table:</text>
     <text class="t-mono" x="521" y="603" style="font-size:8px">spend &#183; PENDING# &#183; RATE# &#183; DECISION#</text>
-    <text class="t-sub" x="521" y="619">rate counters live here too,</text>
-    <text class="t-sub" x="521" y="634">pooled per scope on request</text>
+    <text class="t-sub" x="521" y="619">spend = daily + monthly caps;</text>
+    <text class="t-sub" x="521" y="634">rollup Lambda aggregates them</text>
 
     <rect class="bx" x="306" y="654" width="398" height="68" rx="7"/>
     <text class="t-ttl-sm" x="318" y="675">model-pricing</text>
@@ -295,11 +295,11 @@
     <!-- admin console -->
     <rect class="bx" x="790" y="520" width="210" height="140" rx="9"/>
     <text class="t-ttl-sm" x="804" y="542">Admin console</text>
-    <text class="t-sub" x="804" y="559">API Gateway HTTP API</text>
-    <text class="t-sub" x="804" y="574">&#8594; Lambda (SPA + JSON API)</text>
+    <text class="t-sub" x="804" y="559">CloudFront: / &#8594; private S3 (SPA),</text>
+    <text class="t-sub" x="804" y="574">/api/* &#8594; API GW &#8594; Lambda (JSON)</text>
     <text class="t-sub" x="804" y="594">authz in code: GetUser, then</text>
     <text class="t-mono" x="804" y="609">gateway-admins</text>
-    <text class="t-sub" x="804" y="631" style="fill:#f85149">the public surface is API GW,</text>
+    <text class="t-sub" x="804" y="631" style="fill:#f85149">public surface is CloudFront,</text>
     <text class="t-sub" x="804" y="645" style="fill:#f85149">never the Lambda itself</text>
 
     <text class="t-lbl-s" x="755" y="582" text-anchor="middle">writes policy</text>
@@ -489,7 +489,8 @@
            <b>Rate limit</b> · fixed-window request + token counters per scope, optionally
            <b>pooled</b> across a group → <code>429</code><br>
            <b>Cost budget</b> · reserves worst-case output cost from the resolved output
-           ceiling, charges the ledger → <code>429</code><br>
+           ceiling into a UTC <b>daily</b> and a <b>monthly</b> ledger counter; either cap
+           denies → <code>429</code>, naming the window<br>
            <b>Guardrail</b> · calls <code>ApplyGuardrail</code> on the harvested text →
            <code>403</code>, model never invoked<br>
            Writes a decision record and an audit record for <em>every</em> request.</p>
@@ -644,15 +645,33 @@
            usagetype naming conventions are parsed, including the <code>-mantle-</code>
            usagetypes.</p>
       </div>
+      <div class="up">
+        <h4>Cost rollup table — history, computed off the hot path</h4>
+        <p><code>pk</code> = <code>USER#&lt;username&gt;</code>, <code>sk</code> =
+           <code>D#YYYYMMDD</code> or <code>M#YYYYMM</code> &rarr; cost and request count, long TTL;
+           plus a <code>SUBMAP</code> partition pairing each Cognito <code>sub</code> with its
+           username. Written every 15 minutes by a scheduled Lambda that scans the ledger's
+           <code>DECISION#</code> records and <b>recomputes</b> each aggregate (idempotent; a
+           missed run self-heals), before those records age out at 24 hours.</p>
+        <p>This is how the console answers <em>"what did this user spend this month"</em>
+           without either interceptor doing any reporting work. The spend counters in the
+           ledger remain the <b>enforcement</b> number; this table is the <b>history</b>. For
+           the same UTC day the two agree; they are different tables on purpose.</p>
+      </div>
     </div>
 
     <div class="band" style="margin:0">
       <div class="hdr">Admin console</div>
       <div class="up" style="margin-bottom:10px">
-        <h4>API Gateway HTTP API → Lambda</h4>
-        <p>Serves a single-file SPA and a JSON API. Authorization happens <b>in code</b>: the
-           caller's access token is validated via <code>GetUser</code>, then
-           <code>gateway-admins</code> membership is required.</p>
+        <h4>One CloudFront distribution, two origins</h4>
+        <p>The default behaviour serves the single-file SPA from a <b>private S3 bucket</b>
+           (Origin Access Control only &mdash; direct object access is refused). The
+           <code>/api/*</code> behaviour targets an <b>API Gateway HTTP API &rarr; Lambda</b>
+           that serves the JSON API. Because the UI and the API answer on one origin there is
+           <b>no CORS</b>. Authorization happens <b>in code</b>: the caller's access token is
+           validated via <code>GetUser</code>, then <code>gateway-admins</code> membership is
+           required. The SPA reads its region and Cognito client id from the unauthenticated
+           <code>/api/meta</code>, so the static object needs no server-side templating.</p>
       </div>
       <div class="up">
         <h4>Manages</h4>
@@ -673,12 +692,15 @@
            turning governance off should be a deliberate CLI act, not a button.</p>
       </div>
       <div class="note" style="margin-top:10px">
-        <b>Invariant, enforced at synth time.</b> The public surface is <b>API Gateway</b>, never the
-        Lambda itself. <code>pilot/guards.py</code> applies a CDK aspect that <em>fails the build</em>
+        <b>Invariant, enforced at synth time.</b> The public surface is <b>CloudFront</b>, never the
+        Lambda itself &mdash; the <code>/api/*</code> origin is the API Gateway HTTP API, not a Lambda
+        Function URL. <code>pilot/guards.py</code> applies a CDK aspect that <em>fails the build</em>
         on any Lambda with a wildcard invoke principal or a Function URL with
         <code>authType=NONE</code>. "Authorize in code behind a public invoke endpoint" is not the
         same as "not publicly invokable", and the aspect exists so that distinction cannot be lost by
-        accident. See <code>docs/FINDINGS.md</code> for the incident that prompted it.
+        accident. Fronting the console with CloudFront also removed CORS and makes a WAF web ACL
+        attachable via the distribution's <code>web_acl_id</code> (none attached here). See
+        <code>docs/FINDINGS.md</code> for the incident that prompted it.
       </div>
     </div>
   </div>

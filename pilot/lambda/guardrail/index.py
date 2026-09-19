@@ -755,18 +755,61 @@ def _model_allowed(claims: dict, model: str) -> dict:
     return {"allowed": True, "scope": found["scope"], "reason": "permitted"}
 
 
+def _num(row: dict, attr: str, default: float = 0.0) -> float:
+    """Read a DynamoDB numeric attribute, tolerating absence/garbage."""
+    try:
+        return float(row.get(attr, {}).get("N", default))
+    except Exception:  # noqa: BLE001
+        return float(default)
+
+
 def _budget_for(claims: dict) -> dict:
-    """Resolved cost budget, falling back to the env-var defaults."""
+    """Resolved cost budget as INDEPENDENT daily + monthly caps.
+
+    Either cap can deny. A cap of 0 (or absent) means that window is not enforced, so a
+    scope may set a daily cap, a monthly cap, both, or neither.
+
+    BACKWARD COMPATIBLE with the original single-window schema (`budget_usd` +
+    `window_seconds`): if a row carries only those, the amount is treated as the DAILY
+    cap. New rows use `daily_budget_usd` / `monthly_budget_usd`. The env-var fallback
+    (the demo's tiny per-window budget) is likewise mapped onto the daily cap so a
+    deployment with no BUDGET row still enforces something.
+
+    Returns:
+        {daily, monthly, scope}  -- daily/monthly are USD caps (0 == not enforced).
+    """
     found = _resolve(claims, "BUDGET")
     if not found:
-        return {"budget": _COST_BUDGET, "window": _COST_WINDOW, "scope": "(env default)"}
+        # No row: fall back to the demo env budget as a DAILY cap. Monthly unset.
+        return {"daily": _COST_BUDGET, "monthly": 0.0, "scope": "(env default)"}
     row = found["row"]
-    try:
-        budget = float(row.get("budget_usd", {}).get("N", _COST_BUDGET))
-        window = int(float(row.get("window_seconds", {}).get("N", _COST_WINDOW)))
-    except Exception:  # noqa: BLE001
-        budget, window = _COST_BUDGET, _COST_WINDOW
-    return {"budget": budget, "window": window, "scope": found["scope"]}
+    daily = _num(row, "daily_budget_usd", 0.0)
+    monthly = _num(row, "monthly_budget_usd", 0.0)
+    # Legacy single-window row: no daily/monthly attrs, but a budget_usd is present.
+    if daily <= 0 and monthly <= 0 and "budget_usd" in row:
+        daily = _num(row, "budget_usd", 0.0)
+    return {"daily": daily, "monthly": monthly, "scope": found["scope"]}
+
+
+def _cost_buckets(now: int | None = None) -> dict:
+    """The daily and monthly ledger bucket suffixes for `now` (UTC).
+
+    Daily  -> 'D#YYYYMMDD'  (calendar day, not a rolling 24h window)
+    Monthly-> 'M#YYYYMM'    (calendar month)
+
+    Calendar-aligned buckets (rather than epoch//window) are what make "daily" and
+    "monthly" mean what an operator expects, and they let the out-of-band rollup and the
+    admin console address the exact same rows without knowing a window length.
+    """
+    import time as _time
+    from datetime import datetime, timezone
+
+    ts = now if now is not None else int(_time.time())
+    dt = datetime.fromtimestamp(ts, timezone.utc)
+    return {
+        "day": f"D#{dt.strftime('%Y%m%d')}",
+        "month": f"M#{dt.strftime('%Y%m')}",
+    }
 
 
 def _claim_request(request_id: str) -> dict:
@@ -1136,15 +1179,37 @@ def _estimate_prompt_tokens(text_units: list[str]) -> int:
     return max(1, chars // 4)
 
 
+def _charge_one(pk: str, cost: float, ttl_seconds: int) -> float:
+    """ADD `cost` to one spend counter and return the new total. FAILS CLOSED.
+
+    No try/except: a ledger write that does not land means we do not know what this
+    principal has spent, and unknown spend is not a basis for allowing more of it.
+    """
+    import time as _time
+    resp = _ddb.update_item(
+        TableName=_COST_TABLE,
+        Key={"pk": {"S": pk}},
+        UpdateExpression="ADD spend :c SET #t = :ttl",
+        ExpressionAttributeNames={"#t": "ttl"},
+        ExpressionAttributeValues={
+            ":c": {"N": str(cost)},
+            ":ttl": {"N": str(int(_time.time()) + ttl_seconds)},
+        },
+        ReturnValues="UPDATED_NEW",
+    )
+    return float(resp["Attributes"]["spend"]["N"])
+
+
 def _charge_and_check(
-    user_sub: str, model: str, text_units: list[str], budget: float, window: int,
+    user_sub: str, model: str, text_units: list[str], daily: float, monthly: float,
     max_tokens: int = 0
 ) -> dict:
-    """Add this request's estimated cost to the user's window and report status.
+    """Reserve this request's estimated cost against the DAILY and MONTHLY counters and
+    report whether either cap is exceeded.
 
-    Returns {charged, total, budget, exceeded, sub}. FAILS CLOSED on any ledger error --
-    see the comment at the write below. (This docstring said "fails OPEN" long after the
-    behaviour was deliberately inverted; the write has no try/except.)
+    Returns {charged, daily_total, monthly_total, daily, monthly, exceeded,
+    exceeded_window, sub, day_pk, month_pk}. FAILS CLOSED on any ledger error --
+    the underlying writes have no try/except.
 
     This is a RESERVATION, not a bill: prompt tokens priced for real plus the caller's
     declared `max_tokens` at the output rate. The RESPONSE interceptor reconciles it to
@@ -1176,34 +1241,43 @@ def _charge_and_check(
     cost = (tokens / 1000.0) * _price_per_1k(model)
     if max_tokens > 0:
         cost += (max_tokens / 1000.0) * _output_price_per_1k(model)
-    bucket = int(_time.time()) // max(1, window)
-    pk = f"{user_sub}#{bucket}"
-    # FAILS CLOSED: no try/except. A ledger write that does not land means we do not know
-    # what this principal has spent, and "unknown spend" is not a basis for allowing more
-    # of it. The old handler returned total=0.0 exceeded=False, which did not merely skip
-    # the check — it reported the user as having spent NOTHING, so the very next request
-    # started from a clean budget too.
-    resp = _ddb.update_item(
-        TableName=_COST_TABLE,
-        Key={"pk": {"S": pk}},
-        UpdateExpression="ADD spend :c SET #t = :ttl",
-        ExpressionAttributeNames={"#t": "ttl"},
-        ExpressionAttributeValues={
-            ":c": {"N": str(cost)},
-            ":ttl": {"N": str(int(_time.time()) + window * 5)},
-        },
-        ReturnValues="UPDATED_NEW",
-    )
-    total = float(resp["Attributes"]["spend"]["N"])
+
+    now = int(_time.time())
+    buckets = _cost_buckets(now)
+    day_pk = f"{user_sub}#{buckets['day']}"
+    month_pk = f"{user_sub}#{buckets['month']}"
+
+    # Reserve against BOTH calendar counters. The same `cost` is added to each because
+    # this one request contributes to both the day's spend and the month's spend. TTLs
+    # are sized so the bucket outlives the window it measures: a few extra days for the
+    # daily counter, ~40 days for the monthly.
+    #
+    # FAILS CLOSED throughout: `_charge_one` has no try/except (see its docstring). If
+    # only one cap is configured we still write both counters — the un-capped one is
+    # harmless bookkeeping the rollup and console can read, and writing it keeps the
+    # reconciliation/refund paths symmetric.
+    _DAY_TTL = 3 * 86400
+    _MONTH_TTL = 40 * 86400
+    daily_total = _charge_one(day_pk, cost, _DAY_TTL)
+    monthly_total = _charge_one(month_pk, cost, _MONTH_TTL)
+
+    daily_exceeded = daily > 0 and daily_total > daily
+    monthly_exceeded = monthly > 0 and monthly_total > monthly
+    exceeded_window = "daily" if daily_exceeded else ("monthly" if monthly_exceeded
+                                                      else "")
     return {
         "charged": cost,
-        "total": total,
-        "budget": budget,
-        "exceeded": total > budget,
-        # Returned so the pending row can point the reconciliation at THIS window,
-        # even if the response lands after the window has rolled over.
-        "bucket": bucket,
-        # Needed by _refund_reservation to address the same counter this just incremented.
+        "daily_total": daily_total,
+        "monthly_total": monthly_total,
+        "daily": daily,
+        "monthly": monthly,
+        "exceeded": daily_exceeded or monthly_exceeded,
+        "exceeded_window": exceeded_window,
+        # The two counter keys, so reconciliation/refund address exactly these rows even
+        # if the response lands after a calendar boundary.
+        "day_pk": day_pk,
+        "month_pk": month_pk,
+        # Needed by _refund_reservation / the pending handoff.
         "sub": user_sub,
     }
 
@@ -1233,21 +1307,28 @@ def _refund_reservation(state: dict, decision: str) -> None:
     reason for the denial survives a refund failure too.
     """
     est = float(state.get("charged") or 0.0)
-    sub = state.get("sub") or ""
-    bucket = state.get("bucket")
-    if est <= 0 or not sub or bucket is None:
+    day_pk = state.get("day_pk") or ""
+    month_pk = state.get("month_pk") or ""
+    if est <= 0:
         return
-    _ddb.update_item(
-        TableName=_COST_TABLE,
-        Key={"pk": {"S": f"{sub}#{bucket}"}},
-        UpdateExpression="ADD spend :d",
-        ExpressionAttributeValues={":d": {"N": str(-est)}},
-    )
-    print(f"REFUND ${est:.6f} to {sub[:8]} — denied by {decision}, no output produced")
+    # Reverse BOTH counters, since the reservation was added to both. No try/except: a
+    # failed reversal propagates to `handler` and the request is still denied.
+    for pk in (day_pk, month_pk):
+        if not pk:
+            continue
+        _ddb.update_item(
+            TableName=_COST_TABLE,
+            Key={"pk": {"S": pk}},
+            UpdateExpression="ADD spend :d",
+            ExpressionAttributeValues={":d": {"N": str(-est)}},
+        )
+    sub = state.get("sub") or ""
+    print(f"REFUND ${est:.6f} to {sub[:8]} (day+month) — denied by {decision}, "
+          "no output produced")
 
 
 def _write_pending(request_id: str, claims: dict, model: str, decision_pk: str,
-                   est_cost: float, bucket: int, window: int) -> None:
+                   est_cost: float, day_pk: str, month_pk: str) -> None:
     """Hand off identity to the RESPONSE interceptor via the gateway REQUEST_ID.
 
     WHY THIS EXISTS: the response interceptor sees `gatewayRequest: null` — no JWT, no
@@ -1275,8 +1356,10 @@ def _write_pending(request_id: str, claims: dict, model: str, decision_pk: str,
                 "model": {"S": model or "?"},
                 "decision_pk": {"S": decision_pk or ""},
                 "est_cost": {"N": str(est_cost)},
-                "bucket": {"N": str(bucket)},
-                "window": {"N": str(window)},
+                # BOTH counter keys, so the RESPONSE interceptor reconciles/settles the
+                # exact rows the reservation touched, even across a calendar boundary.
+                "day_pk": {"S": day_pk or ""},
+                "month_pk": {"S": month_pk or ""},
                 # Short TTL: if no response ever arrives, the row simply expires.
                 "ttl": {"N": str(now + 900)},
             },
@@ -1337,15 +1420,18 @@ def _record_decision(claims: dict, model: str, path: str, decision: str,
 
 
 def _budget_block(state: dict, model: str) -> dict:
+    win = state.get("exceeded_window") or "daily"
+    spent = state["daily_total"] if win == "daily" else state["monthly_total"]
+    cap = state["daily"] if win == "daily" else state["monthly"]
     payload = {
         "error": {
             "type": "cost_budget_exceeded",
             "message": (
-                f"Spend budget exceeded: ${state['total']:.4f} of "
-                f"${state['budget']:.4f} in the current window. "
-                "Enforced at the gateway for all upstream surfaces."
+                f"{win.capitalize()} spend budget exceeded: ${spent:.4f} of "
+                f"${cap:.4f}. Enforced at the gateway for all upstream surfaces."
             ),
-            "detail": {"model": model, "scope": state.get("scope")},
+            "detail": {"model": model, "scope": state.get("scope"),
+                       "window": win},
         }
     }
     body_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
@@ -1724,9 +1810,9 @@ def _govern(event, context, deadline: "_Deadline", reservation: dict | None = No
     budget_cfg = _budget_for(claims)
     # NOTE: `_charge_state` is initialised near the top of _govern, above _finish, because
     # _finish closes over it. Do not re-declare it here.
-    if _COST_TABLE and budget_cfg["budget"] > 0 and user_sub:
+    if _COST_TABLE and (budget_cfg["daily"] > 0 or budget_cfg["monthly"] > 0) and user_sub:
         state = _charge_and_check(
-            user_sub, model, text_units, budget_cfg["budget"], budget_cfg["window"],
+            user_sub, model, text_units, budget_cfg["daily"], budget_cfg["monthly"],
             max_tokens=norm["max_output_tokens"],
         )
         state["scope"] = budget_cfg["scope"]
@@ -1739,15 +1825,25 @@ def _govern(event, context, deadline: "_Deadline", reservation: dict | None = No
             reservation.clear()
             reservation.update(state)
         print(f"cost sub={user_sub[:8]} model={model} charged=${state['charged']:.5f} "
-              f"total=${state['total']:.5f} budget=${state['budget']:.5f} "
-              f"scope={budget_cfg['scope']} exceeded={state['exceeded']}")
+              f"day=${state['daily_total']:.5f}/{state['daily']:.5f} "
+              f"month=${state['monthly_total']:.5f}/{state['monthly']:.5f} "
+              f"scope={budget_cfg['scope']} exceeded={state['exceeded']}"
+              f"({state['exceeded_window']})")
         if state["exceeded"]:
+            win = state["exceeded_window"]
+            spent = state["daily_total"] if win == "daily" else state["monthly_total"]
+            cap = state["daily"] if win == "daily" else state["monthly"]
             _record_decision(claims, model, path, "cost_budget_exceeded", 429,
                              budget_cfg["scope"])
             _audit(**audit_base, decision="cost_budget_exceeded", status=429,
                    control="cost_budget", scope=budget_cfg["scope"],
-                   spend_usd=round(state["total"], 6),
-                   budget_usd=round(state["budget"], 6),
+                   budget_window=win,
+                   spend_usd=round(spent, 6),
+                   budget_usd=round(cap, 6),
+                   daily_spend_usd=round(state["daily_total"], 6),
+                   daily_budget_usd=round(state["daily"], 6),
+                   monthly_spend_usd=round(state["monthly_total"], 6),
+                   monthly_budget_usd=round(state["monthly"], 6),
                    charged_usd=round(state["charged"], 6))
             return _finish(
                 {"allow": False, "decision": "cost_budget_exceeded", "status": 429,
@@ -1872,15 +1968,17 @@ def _govern(event, context, deadline: "_Deadline", reservation: dict | None = No
     # Corollary worth knowing: a PENDING row existing means "the interceptor allowed
     # this request". Denials never write one, so the response side can tell the two
     # cases apart with no extra field.
+    _pend_buckets = _cost_buckets()
     _write_pending(
         request_id=request_id,
         claims=claims,
         model=model,
         decision_pk=decision_pk,
         est_cost=(_charge_state["charged"] if _charge_state is not None else 0.0),
-        bucket=(_charge_state["bucket"] if _charge_state is not None
-                else int(time.time()) // max(1, budget_cfg["window"])),
-        window=budget_cfg["window"],
+        day_pk=(_charge_state["day_pk"] if _charge_state is not None
+                else f"{user_sub}#{_pend_buckets['day']}"),
+        month_pk=(_charge_state["month_pk"] if _charge_state is not None
+                  else f"{user_sub}#{_pend_buckets['month']}"),
     )
     _audit(**audit_base, decision="allowed", status=200, control="guardrail",
            scope=gr["scope"], guardrail_evaluated=True,
@@ -1888,7 +1986,9 @@ def _govern(event, context, deadline: "_Deadline", reservation: dict | None = No
            guardrail_version=gr["guardrail_version"], guardrail_action=action,
            reserved_usd=(round(_charge_state["charged"], 6)
                          if _charge_state is not None else None),
-           spend_usd=(round(_charge_state["total"], 6)
-                      if _charge_state is not None else None),
+           daily_spend_usd=(round(_charge_state["daily_total"], 6)
+                            if _charge_state is not None else None),
+           monthly_spend_usd=(round(_charge_state["monthly_total"], 6)
+                              if _charge_state is not None else None),
            model_invoked=True)
     return _finish({"allow": True, "decision": "allowed"}, _passthrough())

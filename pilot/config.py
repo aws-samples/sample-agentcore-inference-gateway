@@ -73,8 +73,8 @@ def _resolve_env() -> tuple[str, str]:
 AWS_ACCOUNT, AWS_REGION = _resolve_env()
 
 # Resource naming: every resource this pilot creates carries this prefix so it
-# is visually isolated from the other gateways already in the account
-# (ameren-kb-gateway-*, TestGateway*). Do not reuse these names elsewhere.
+# is visually isolated from any other gateways already in the account. Do not
+# reuse these names elsewhere.
 PREFIX = "acgw-pilot"
 STACK_NAME = "AcgwPilotFoundationStack"
 
@@ -301,8 +301,23 @@ DEMO_RATE_WINDOW_SECONDS = 60
 INTERCEPTOR_TIMEOUT_SECONDS = 20
 INTERCEPTOR_SAFETY_MARGIN_MS = 2000
 
-DEMO_COST_BUDGET_USD = 0.02       # per user, per window
-DEMO_COST_WINDOW_SECONDS = 60     # fixed window
+DEMO_COST_BUDGET_USD = 0.02       # per user, per window (legacy env fallback = daily cap)
+DEMO_COST_WINDOW_SECONDS = 60     # legacy fixed window (kept for the env fallback)
+# Dual calendar budgets: EITHER can deny. Seeded small so the demo trips them easily.
+# 0 means "that window is not enforced".
+DEMO_COST_DAILY_BUDGET_USD = 0.05     # per user, per calendar day (UTC)
+DEMO_COST_MONTHLY_BUDGET_USD = 0.50   # per user, per calendar month (UTC)
+
+# ---- Cost rollup (out-of-band aggregator) ----------------------------------
+# A scheduled Lambda folds the ledger's DECISION# records into durable per-user
+# daily/monthly cost aggregates, so the console can look back past the 24h decision TTL
+# and show daily/monthly spend WITHOUT adding any work to the interceptors. Runs often
+# enough that the console is never far behind, cheap because it is a single table scan.
+COST_ROLLUP_TABLE_NAME = f"{PREFIX}-cost-rollup"
+COST_ROLLUP_INTERVAL_MINUTES = 15
+# Aggregate rows persist far longer than the source decision records (which live 24h),
+# which is the whole point: the history survives once the raw rows expire.
+COST_ROLLUP_TTL_SECONDS = 400 * 24 * 60 * 60   # ~13 months
 
 # ---- How long the admin console can look back -------------------------------
 # The interceptor writes one `DECISION#` record per request into the ledger table, and

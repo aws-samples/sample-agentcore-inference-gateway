@@ -1751,10 +1751,89 @@ is a known edit if you want the other side of it.
   `source_ip` is needed at all. The sample makes no compliance claim; see
   [`ADMIN-CONSOLE.md`](ADMIN-CONSOLE.md) *Relationship to the central audit log* and the AWS
   [GDPR Center](https://aws.amazon.com/compliance/gdpr-center/).
-- **The admin console has no CloudFront or WAF in front of it**, CORS is `*`, there is no
-  optimistic concurrency on policy edits, and its statistics read the 24-hour decision records
-  rather than the 90-day audit log — it links out to Logs Insights for anything older. All
-  tracked in [`ADMIN-CONSOLE.md`](ADMIN-CONSOLE.md).
+- **The admin console is behind CloudFront (SPA on private S3, API on the same distribution),
+  so CORS is gone and WAF is attachable** via the distribution's `web_acl_id` — though no WAF
+  is attached here. What remains: there is no optimistic concurrency on policy edits, and its
+  per-request statistics read the 24-hour decision records rather than the 90-day audit log (it
+  links out to Logs Insights for anything older). All tracked in
+  [`ADMIN-CONSOLE.md`](ADMIN-CONSOLE.md).
+
+## Dual daily + monthly budgets, and why the aggregation runs out of band
+
+The `BUDGET` kind carries **independent daily and monthly caps** (`daily_budget_usd`,
+`monthly_budget_usd`); either can deny with `429 cost_budget_exceeded`, and the message names
+the window that tripped. A single request reserves the **same** estimated cost into two
+calendar-aligned ledger counters — `<sub>#D#YYYYMMDD` and `<sub>#M#YYYYMM`, both UTC — and the
+RESPONSE interceptor reconciles the difference into both. Calendar buckets (not `epoch//window`)
+are what make "daily" and "monthly" mean what an operator expects, and they let the out-of-band
+rollup and the console address the exact same rows without knowing a window length. A legacy
+single-window row (`budget_usd`/`window_seconds`) is still honoured as the daily cap.
+
+⚠️ **The counters must be adjusted symmetrically.** Reserve adds to both; reconcile and refund
+must subtract from both. An asymmetric add/subtract drives a counter **negative**, and a
+negative total silently disables its cap (`total > cap` is never true). This showed up while
+testing across the single→dual schema migration on a long-lived stack — old reservations under
+one scheme, refunds under another — and looked exactly like "budgets stopped enforcing". It is
+not a logic bug in the final code (a fresh deploy starts every counter at 0), but it is a real
+operational hazard when migrating a live ledger: reset the spend counters when you change the
+counter scheme.
+
+## Per-user cost history: an out-of-band rollup, never in the interceptors
+
+The console needs to answer "what did this user spend this day / this month", over weeks — but
+the `DECISION#` records it reads for the fast per-request view expire after 24 hours, and the
+interceptors must not do any non-essential work (a request-interceptor timeout fails the gateway
+**open**, so every millisecond there is a liability).
+
+So the aggregation lives in a **separate scheduled Lambda** (`acgw-pilot-cost-rollup`,
+EventBridge every 15 min), not in either interceptor. It reads the ledger's decision records
+and writes durable per-user daily/monthly cost aggregates to a second table
+(`acgw-pilot-cost-rollup`, ~400-day TTL), recomputed each run (idempotent `SET`, not `ADD`), so
+a missed run self-heals on the next pass and the interceptors are never touched. The same job
+harvests the `sub → username` pairing off-path (decision records carry both), which is what lets
+the sub-keyed live spend counters be shown with usernames. The generalising rule: **keep the hot
+path lean by moving reporting/aggregation to a scheduled reader of what the hot path already
+wrote.**
+
+**Two views of cost, and what "they disagree" means.** The console now shows spend in two
+places: *Live counters* (the ledger's enforcement counters) and *Cost history* (the rollup). For
+the same UTC day they agree to the cent — measured `$0.001454` on both sides for each demo user
+after a 15-request burst on the live stack. They *were* found disagreeing once (`$0.000000` vs
+`$0.025`), and the cause was the counter reset described above: the rollup had already summed
+the decision records, so the history survived the reset while enforcement restarted from zero.
+That is the intended failure mode — history is durable, enforcement state is not — but it reads
+as a bug unless the two views are labelled for what they are, so the console now says so.
+
+**Rate counters: "active" means the current bucket, not "not yet reaped".** The first version of
+the live rate view showed every `RATE#` row a scan returned. The interceptor gives each row a
+`ttl` of three windows plus a minute (grace, so a request straddling a boundary still finds its
+row), and DynamoDB reaps expired rows lazily — up to 48 hours — so with a 60s window the view
+listed several closed buckets as if they were live allowances. The row's `ttl` is therefore the
+wrong signal; the right one is the key itself: a bucket is current iff it equals `now // w` for a
+configured window `w`. Bucket numbers for different window sizes are orders of magnitude apart,
+so the test needs no knowledge of which `RATELIMIT` row governs a given subject.
+
+## Model pickers poll the live Bedrock catalog
+
+The rule builder and effective-access probe used to offer only the configured + observed model
+ids. They now poll the live catalog of **each** surface (`/api/catalog`):
+
+- **mantle** — a SigV4-signed `GET https://bedrock-mantle.<region>.api.aws/v1/models`, signed
+  as service `bedrock`. This is the genuine list the mantle inference surface serves (~55
+  models: Anthropic, DeepSeek, Google Gemma, Mistral, OpenAI gpt-oss, Qwen, Zai, Nvidia).
+- **runtime** — `bedrock:ListInferenceProfiles`, the `us.*` cross-region profile ids the
+  passthrough actually addresses (~77), with `ListFoundationModels` as a fallback.
+
+⚠️ **These are NOT the same catalog, and substituting one for the other is a real bug.** A
+first version derived the "mantle" list from `ListFoundationModels`, because the
+gateway-fronted `/inference/v1/models` is Cognito-JWT-authorized and the admin Lambda holds
+AWS credentials, not a user token. That put ~115 ids in the mantle picker — including Nova
+Canvas/Reel/embeddings and Jamba — most of which the mantle endpoint never serves, while
+missing the providers mantle actually hosts. The fix was to skip the gateway and sign a request
+to the mantle **service** endpoint directly, exactly as the gateway's own inference-provider
+target does. Mantle is a distinct IAM service namespace (`bedrock-mantle:*`), so the console
+role needed `bedrock-mantle:ListModels`; without it the call fails soft to an empty list, which
+would have hidden the problem — verify the picker shows mantle models after any IAM change.
 
 ## The three lessons that generalise
 

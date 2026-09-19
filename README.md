@@ -106,8 +106,10 @@ flowchart TB
     LEDGER[("<b>cost-ledger</b><br/>spend · rate counters · decisions")]
     PRICES[("<b>model-pricing</b><br/>refreshed daily")]
     AUDIT["<b>Central audit log</b><br/>CloudWatch · 90 days · PII masked"]
-    CONSOLE["<b>Admin console</b><br/>API Gateway + Lambda + Cognito"]
+    CONSOLE["<b>Admin console</b><br/>CloudFront + S3 + API Gateway + Cognito"]
     SYNC["<b>Pricing sync</b><br/>EventBridge daily → Price List API"]
+    ROLLUP["<b>Cost rollup</b><br/>EventBridge 15 min · out of band"]
+    HIST[("<b>cost-rollup</b><br/>per-user daily · monthly")]
 
     CLIENT --> L1 --> L2 --> L3
     L3 -->|"SigV4 · one execution role"| MANTLE
@@ -124,6 +126,8 @@ flowchart TB
     L2 -.-> AUDIT
     L4 -.-> AUDIT
     SYNC -.->|"writes"| PRICES
+    LEDGER -.->|"reads decisions"| ROLLUP -.->|"writes"| HIST
+    HIST -.->|"cost history"| CONSOLE
     CONSOLE -.->|"writes"| CFG
 ```
 
@@ -198,7 +202,7 @@ Policy lives in a DynamoDB **config table**, not in code:
 | Key | Values |
 |---|---|
 | `pk` (scope) | `DEFAULT` · `GROUP#<group>` · `USER#<username>` |
-| `sk` (kind) | `MODELS` (allow/deny globs) · `RATELIMIT` (tokens + requests + window + pooled) · `BUDGET` (usd + window) · `GUARDRAIL` (id + enabled) |
+| `sk` (kind) | `MODELS` (allow/deny globs) · `RATELIMIT` (tokens + requests + window + pooled) · `BUDGET` (daily USD + monthly USD, either denies) · `GUARDRAIL` (id + version + enabled) |
 
 Resolution is **`USER` → `GROUP` → `DEFAULT`**, per kind, first match wins. One glob covers
 both surfaces: `*claude-opus*` matches mantle's `anthropic.claude-opus-5` and runtime's
@@ -297,8 +301,9 @@ This is a demonstration, not a production blueprint. The headlines:
 - **No layer's own record is the request outcome.** The interceptor decides before Cedar, so the
   RESPONSE interceptor has to stamp the true final status back onto the record. A denial is
   attributed to Cedar by deduction, not by the gateway reporting it.
-- **Fixed windows** for rate and budget, so a burst straddling a boundary briefly exceeds the
-  intended rate.
+- **Fixed windows**: rate limits use fixed epoch buckets and budgets use UTC calendar days and
+  months, so a burst straddling a boundary briefly exceeds the intended rate, and a user's
+  daily budget resets at 00:00 UTC regardless of their time zone.
 - **Demo-grade identity**: passwords generated at deploy time (or set via env var) and exposed
   as stack outputs, password flow rather than hosted UI with PKCE, and the pool is destroyed
   with the stack.
@@ -319,16 +324,17 @@ made, with the exact errors that proved each one, is the closing section of
   [`docs/FINDINGS.md`](docs/FINDINGS.md).
 - **Pooled *budgets*.** Rate limits pool across a group; cost budgets do not yet — a `GROUP#`
   budget still applies per member. Same fix: key the spend counter on the matched scope.
-- **Console migration to S3 + CloudFront.** Deferred until the admin UI changes are done.
-  Putting the SPA on private S3 behind CloudFront with the API on the same distribution removes
-  the `CORS: *` gap and makes WAF attachable.
+- **WAF on the console.** The console is behind CloudFront (SPA on private S3, API on the same
+  distribution, so there is no CORS), which makes a WAF web ACL attachable via the
+  distribution's `web_acl_id` — but none is attached here.
 - **Admin mutations into the central audit log.** One line — the console function is not yet
   pointed at the shared log group, so "who changed the policy" and "what did we enforce" live
   in two places.
-- **Point console statistics at the audit log** so they are not limited to the 24-hour decision
-  TTL, and so the horizon is set by the archive rather than by what a DynamoDB scan can
-  affordably retain. The data is already there for 90 days with the field indexes needed to
-  query it; today the console links out to Logs Insights instead.
+- **Per-request statistics history beyond 24 hours.** Per-user **daily/monthly cost** now comes
+  from an out-of-band rollup that outlives the decision-record TTL (a scheduled Lambda writes
+  durable aggregates to a separate table — the interceptors are untouched). The *per-request*
+  table is still bounded by the 24-hour decision TTL; reading that raw history from the 90-day
+  audit log is still open, and the console links out to Logs Insights for it today.
 - **Alarm on the fail-closed decisions** — `governance_timeout`, `governance_unavailable` and
   `breakglass_bypass` belong on a metric filter, not just in a log.
 - **Response-side content moderation** (output PII/redaction), for cases where buffering is
@@ -354,7 +360,8 @@ pilot/
                              guardrail, audit — fail closed throughout
   lambda/usage/              RESPONSE interceptor: true-cost reconciliation + response audit
   lambda/pricing/            daily price refresh from the AWS Price List API
-  lambda/admin/              admin console: JSON API + single-file SPA
+  lambda/rollup/             out-of-band cost rollup: per-user daily/monthly aggregates (15 min)
+  lambda/admin/              admin console JSON API (SPA ships to private S3 behind CloudFront)
 walkthrough.ipynb            the walkthrough (run top to bottom against your deployment)
 architecture-diagram.html    in-depth architecture: end-to-end diagram + element detail
 docs/DEPLOYMENT.md           deploy into your own account: prereqs, steps, troubleshooting
@@ -382,11 +389,13 @@ failed, and that record is the part worth reusing.
 
 ## Cost and teardown
 
-Running cost is dominated by Bedrock token usage; the gateway, four small Lambdas, three
-on-demand DynamoDB tables, Cognito and a guardrail are minor by comparison — but none of it
-sits in a free tier. Two line items are easy to overlook: CloudWatch **data protection**
-scanning is charged per GB ingested into the audit log, and the daily pricing refresh makes
-~1400 Price List API calls (free, but a real Lambda invocation).
+Running cost is dominated by Bedrock token usage; the gateway, five small Lambdas, four
+on-demand DynamoDB tables, a CloudFront distribution, Cognito and a guardrail are minor by
+comparison — but none of it sits in a free tier. Three line items are easy to overlook:
+CloudWatch **data protection** scanning is charged per GB ingested into the audit log, the
+daily pricing refresh makes ~1400 Price List API calls (free, but a real Lambda invocation),
+and the cost rollup scans the ledger every 15 minutes (a full table scan, trivial at demo
+scale, worth knowing about at any other).
 
 ```powershell
 npx cdk destroy AcgwPilotFoundationStack

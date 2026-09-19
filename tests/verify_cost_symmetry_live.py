@@ -1,30 +1,35 @@
-"""Live check: does a DENIED request cost the caller nothing?
+"""Live check: does a DENIED request cost the caller nothing, on BOTH budget counters?
 
 The reservation is taken at CONTROL 3, before several controls that can still deny, so
 every denial after that point used to leave the caller billed for output that was never
 generated. This drives each denial path against the deployed gateway and asserts the
-caller's window counter is unchanged.
+caller's spend counters are unchanged.
 
-Measured directly on the ledger, not inferred from audit records: the counter
-`<sub>#<bucket>` is the thing enforcement actually reads, so it is the thing that has to
-be right. Reading a "refunded: true" log line would only prove we logged it.
+Measured directly on the ledger, not inferred from audit records: the counters are the
+thing enforcement actually reads, so they are the thing that has to be right. Reading a
+"refunded: true" log line would only prove we logged it.
 
-⚠️ THE TRAP THIS TEST FELL INTO FIRST, because it is the whole reason it is careful now.
-The bucket is `int(time) // window`, and `window` comes from the caller's RESOLVED budget
-row, not from `config.DEMO_COST_WINDOW_SECONDS`. The live table carries a
-`GROUP#ai-platform` budget of $50 over **86400s**, so for alice and bob the interceptor
-writes to a DAILY bucket. Reading a 60-second bucket for them read a row that does not
-exist: `$0.000000 -> $0.000000`, delta zero, reported as a clean PASS while measuring
-nothing at all. So this script resolves each principal's scope chain exactly the way the
-interceptor does (USER# -> GROUP# in token order -> DEFAULT) and reads the same key.
+THE COUNTERS ARE CALENDAR-ALIGNED AND THERE ARE TWO OF THEM. Every request reserves the
+same estimated cost into a daily counter `<sub>#D#YYYYMMDD` and a monthly counter
+`<sub>#M#YYYYMM` (both UTC), and either the daily or the monthly cap can deny. Reconcile and
+refund must adjust BOTH by the same amount: an asymmetric add/subtract drives one counter
+negative, and a negative total silently disables its cap (`total > cap` is never true). So
+this script reads both counters every time and asserts they moved identically -- for an
+allowed request (both up by the same amount) as much as for a denial (both flat).
 
-The general lesson, worth more than the test: **anything that verifies an enforcement
-decision has to resolve config through the enforcement point's own precedence.** This is
-the same class of bug as the admin console's effective-access preview matching globs
-against pricing-table keys instead of request-shaped model ids.
+⚠️ THE TRAP THE FIRST VERSION OF THIS TEST FELL INTO, kept because the lesson generalises.
+The counter key used to be `<sub>#<epoch // window>` with `window` taken from the caller's
+RESOLVED budget row. Reading a 60-second bucket for a user whose resolved row said 86400s
+read a row that does not exist: `$0.000000 -> $0.000000`, delta zero, reported as a clean
+PASS while measuring nothing at all. The calendar scheme removes the window from the key,
+but the rule stands: **anything that verifies an enforcement decision has to address the
+exact row the enforcement point writes.** This script therefore also prints the resolved
+budget scope chain (USER# -> GROUP# in token order -> DEFAULT), because that is what decides
+whether scenario 3 can force a denial at all.
 
 Scenarios, in order of how late the denial lands:
 
+  0. an ALLOWED request      -- baseline: day and month must move by the SAME amount (> 0)
   1. model entitlement  (CONTROL 1)  -- denies BEFORE the reservation; must charge nothing
   2. guardrail          (CONTROL 4)  -- denies AFTER the reservation; needs the refund
   3. cost budget        (CONTROL 3)  -- the worst case: it used to charge you for being
@@ -32,12 +37,19 @@ Scenarios, in order of how late the denial lands:
   4. Cedar              (after the whole interceptor) -- the request side already returned
                                         ALLOW, so only the RESPONSE interceptor can refund
 
+Scenarios 1 and 3 each install a temporary `USER#bob` config row to FORCE the denial, and
+restore whatever was there in a `finally`. Relying on the deployed rows instead is how
+scenario 1 once reported a 200: a permissive `GROUP#` MODELS row written from the console
+out-ranked the `DEFAULT` deny for its members (first match per kind, no merge), which is
+documented behaviour, not a bypass -- but a test that assumes config is a test of nothing.
+
 Finally it checks for leftover `PENDING#` rows. A `PENDING#` row means "in flight"; one
 that outlives its request is a reservation nobody settled.
 """
 import json
 import sys
 import time
+from datetime import datetime, timezone
 
 import boto3
 import requests
@@ -45,7 +57,7 @@ import requests
 sys.path.insert(0, ".")
 from pilot import config, inference_client as ic  # noqa: E402
 
-ddb = boto3.client("dynamodb", region_name="us-east-1")
+ddb = boto3.client("dynamodb", region_name=config.AWS_REGION)
 LEDGER = f"{config.PREFIX}-cost-ledger"
 CONFIG_TABLE = f"{config.PREFIX}-governance-config"
 
@@ -89,53 +101,65 @@ def resolve(user: str, kind: str):
     return None, None
 
 
+def _num(row, key):
+    try:
+        return float(row[key]["N"]) if row and key in row else 0.0
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
 BUDGETS = {}
 for u in ("alice", "bob", "carol"):
     sc, row = resolve(u, "BUDGET")
-    BUDGETS[u] = {
-        "scope": sc or "(none)",
-        "budget": float(row["budget_usd"]["N"]) if row and "budget_usd" in row else 0.0,
-        "window": int(row["window_seconds"]["N"]) if row and "window_seconds" in row
-        else config.DEMO_COST_WINDOW_SECONDS,
-    }
+    # New schema: daily_budget_usd / monthly_budget_usd. A legacy single-window row
+    # (budget_usd) is honoured by the interceptor as the DAILY cap; mirror that here.
+    daily = _num(row, "daily_budget_usd") or _num(row, "budget_usd")
+    BUDGETS[u] = {"scope": sc or "(none)", "daily": daily,
+                  "monthly": _num(row, "monthly_budget_usd")}
 
 print("=" * 100)
-print("DENIED REQUESTS MUST COST NOTHING")
+print("DENIED REQUESTS MUST COST NOTHING -- ON BOTH COUNTERS")
 print(f"ledger={LEDGER}")
-print("resolved budget scopes (this is what decides which ledger row to read):")
+print("resolved budget scopes (this is what decides whether scenario 3 can force a denial):")
 for u, b in BUDGETS.items():
-    print(f"    {u:6} scope={b['scope']:22} budget=${b['budget']:<8} "
-          f"window={b['window']}s")
+    print(f"    {u:6} scope={b['scope']:22} daily=${b['daily']:<8} monthly=${b['monthly']:<8}")
 gr_scopes = {u: resolve(u, "GUARDRAIL")[0] for u in ("alice", "bob")}
 print(f"resolved guardrail scopes: {gr_scopes}")
 print("=" * 100)
 
 
-def bucket_of(user: str) -> int:
-    return int(time.time()) // max(1, BUDGETS[user]["window"])
+# --- the two counters -----------------------------------------------------------
+def buckets(now: float | None = None) -> tuple:
+    """The interceptor's `_cost_buckets`: UTC calendar day and month."""
+    t = datetime.fromtimestamp(now or time.time(), timezone.utc)
+    return f"D#{t.strftime('%Y%m%d')}", f"M#{t.strftime('%Y%m')}"
 
 
-def spend(user: str, bucket: int) -> float:
-    """The window counter enforcement reads. Absent row == $0, not an error."""
-    got = ddb.get_item(TableName=LEDGER,
-                       Key={"pk": {"S": f"{subs[user]}#{bucket}"}},
-                       ConsistentRead=True)
-    it = got.get("Item")
-    return float(it["spend"]["N"]) if it and "spend" in it else 0.0
+def spend(user: str, day: str, month: str) -> tuple:
+    """(daily, monthly) spend the interceptor enforces against. Absent row == $0."""
+    out = []
+    for bucket in (day, month):
+        got = ddb.get_item(TableName=LEDGER,
+                           Key={"pk": {"S": f"{subs[user]}#{bucket}"}},
+                           ConsistentRead=True)
+        it = got.get("Item")
+        out.append(float(it["spend"]["N"]) if it and "spend" in it else 0.0)
+    return tuple(out)
 
 
-def wait_for_fresh_bucket(user: str, min_seconds_left: int = 25) -> int:
-    """Start a scenario only with room to finish inside one bucket.
+def wait_for_room(min_seconds_left: int = 60) -> tuple:
+    """Start a scenario only with room to finish inside the current UTC day.
 
-    Without this, a denial landing after the boundary writes to a different counter and
-    the before/after comparison is meaningless -- it would read as a clean PASS.
+    A denial landing after 00:00 UTC writes to a different daily counter and the
+    before/after comparison is meaningless -- it would read as a clean PASS. Only ever
+    waits in the last minute of the day.
     """
-    w = BUDGETS[user]["window"]
     while True:
-        b = bucket_of(user)
-        left = (b + 1) * w - time.time()
+        now = time.time()
+        t = datetime.fromtimestamp(now, timezone.utc)
+        left = 86400 - (t.hour * 3600 + t.minute * 60 + t.second)
         if left >= min_seconds_left:
-            return b
+            return buckets(now)
         time.sleep(min(left + 0.5, 5))
 
 
@@ -166,99 +190,128 @@ SETTLE_WAIT = 12
 results = []
 
 
-def scenario(label, user, run, expect_status):
-    b = wait_for_fresh_bucket(user)
-    before = spend(user, b)
+def scenario(label, user, run, expect_status, expect_charge=False):
+    day, month = wait_for_room()
+    before = spend(user, day, month)
     status, why = run()
     time.sleep(SETTLE_WAIT)
-    rolled = bucket_of(user) != b
-    after = spend(user, b)
-    delta = after - before
+    rolled = buckets() != (day, month)
+    after = spend(user, day, month)
+    d_day, d_month = after[0] - before[0], after[1] - before[1]
     if rolled:
-        results.append((label, "SKIPPED", "window rolled mid-scenario", status, why))
+        results.append((label, "SKIPPED", "UTC day rolled mid-scenario", status, why))
         return
     status_ok = (status == expect_status) if expect_status else True
-    ok = abs(delta) < 1e-9 and status_ok
-    detail = f"${before:.6f} -> ${after:.6f} (delta ${delta:+.6f})"
+    symmetric = abs(d_day - d_month) < 1e-9
+    if expect_charge:
+        ok = status_ok and symmetric and d_day > 0
+    else:
+        ok = status_ok and abs(d_day) < 1e-9 and abs(d_month) < 1e-9
+    detail = (f"day ${before[0]:.6f} -> ${after[0]:.6f} ({d_day:+.6f})  "
+              f"month ${before[1]:.6f} -> ${after[1]:.6f} ({d_month:+.6f})")
+    if not symmetric:
+        detail += "  [ASYMMETRIC: one counter drifts]"
     if not status_ok:
         detail += f"  [expected status {expect_status}]"
     results.append((label, "PASS" if ok else "FAIL", detail, status, why))
 
 
+# 0. Baseline: an allowed request must charge BOTH counters by the same amount. This is
+#    what makes the "flat" assertions below meaningful -- and it is the direct test of the
+#    symmetry hazard (asymmetric writes silently disable a cap).
+scenario("0. allowed request charges day == month", "alice",
+         lambda: post("alice", f"{BASE}/messages", body(SONNET, BENIGN, mx=60)), 200,
+         expect_charge=True)
+
 # 1. Model entitlement -- denies at CONTROL 1, before anything is charged.
-scenario("1. model entitlement (pre-reservation)", "bob",
-         lambda: post("bob", f"{BASE}/messages", body(OPUS, BENIGN)), 403)
+#    Do not ASSUME the resolved MODELS row denies opus for bob: resolution is first match
+#    per kind (USER# -> GROUP# -> DEFAULT, no merge), so a permissive GROUP# row written from
+#    the console silently makes a DEFAULT deny irrelevant for its members -- which is exactly
+#    how this scenario once reported a 200 and looked like a bypass. Force the condition
+#    with a temporary USER#bob row instead, restored in `finally`.
+print("\n  (1) installing a temporary USER#bob MODELS deny to force an entitlement denial...")
+MODELS_SCOPE, MODELS_KIND = "USER#bob", "MODELS"
+had_models = ddb.get_item(TableName=CONFIG_TABLE,
+                          Key={"pk": {"S": MODELS_SCOPE}, "sk": {"S": MODELS_KIND}}).get("Item")
+try:
+    ddb.put_item(TableName=CONFIG_TABLE, Item={
+        "pk": {"S": MODELS_SCOPE}, "sk": {"S": MODELS_KIND},
+        "allow": {"L": [{"S": "*"}]}, "deny": {"L": [{"S": "*claude-opus*"}]},
+    })
+    wait = config.CONFIG_CACHE_TTL_SECONDS + 3
+    print(f"      waiting {wait}s for the interceptor's config cache to expire...")
+    time.sleep(wait)
+    scenario("1. model entitlement (pre-reservation)", "bob",
+             lambda: post("bob", f"{BASE}/messages", body(OPUS, BENIGN)), 403)
+finally:
+    if had_models:
+        ddb.put_item(TableName=CONFIG_TABLE, Item=had_models)
+        print(f"      restored the pre-existing {MODELS_SCOPE}/{MODELS_KIND} row")
+    else:
+        ddb.delete_item(TableName=CONFIG_TABLE,
+                        Key={"pk": {"S": MODELS_SCOPE}, "sk": {"S": MODELS_KIND}})
+        print(f"      removed the temporary {MODELS_SCOPE}/{MODELS_KIND} row")
 
 # 2. Guardrail -- CONTROL 4, i.e. AFTER the reservation. This is the case that needed the
-#    refund in `_finish`.
-#    ⚠️ Uses BOB, not alice, and that is not arbitrary: the live table carries a
-#    `USER#alice` GUARDRAIL row pointing at a DIFFERENT guardrail (a leftover from admin
-#    console testing) which does not carry the PROMPT_ATTACK filter, so the injection below
-#    returns 200 for her. Bob resolves the DEFAULT row, i.e. this stack's guardrail.
+#    refund in `_finish`. Uses bob so the DEFAULT guardrail row (this stack's guardrail,
+#    with the PROMPT_ATTACK filter) is the one resolved; a USER#<name> GUARDRAIL row
+#    pointing elsewhere would change the outcome, which is why the scopes are printed above.
 scenario("2. guardrail block (post-reservation)", "bob",
          lambda: post("bob", f"{BASE}/messages", body(SONNET, INJECTION)), 403)
 
 # 3. Cost budget -- the worst case, and the one that used to charge a user for being told
-#    they were over budget. Bob's resolved budget is $50/day, so temporarily install a tiny
-#    USER#bob row. Restored in `finally`; this is the only scenario that mutates runtime
-#    state.
+#    they were over budget. Temporarily install a tiny USER#bob DAILY cap, below a single
+#    request's reservation, so every attempt is denied. Restored in `finally`; this is the
+#    only scenario that mutates runtime state.
 #
-#    ⚠️ DO NOT try to force this by burning the budget with a loop. That was the first
-#    attempt and it cannot work: the RESPONSE interceptor reconciles each reservation DOWN
-#    to actual cost before the next sequential request starts, so a 400-token reservation of
-#    ~$0.006 settles to ~$0.001 and the counter creeps instead of climbing. Measured: six
-#    calls took the total from $0.006036 to $0.010946, never reaching $0.02. Reconciliation
-#    working correctly is what makes the burn approach useless.
+#    ⚠️ DO NOT try to force this by burning the budget with a loop. The RESPONSE interceptor
+#    reconciles each reservation DOWN to actual cost before the next sequential request
+#    starts, so the counter creeps instead of climbing and never reaches the cap.
+#    Reconciliation working correctly is what makes the burn approach useless.
 #
-#    So set the budget BELOW a single request's reservation. Then every attempt is denied,
-#    which is the sharper test anyway: under the old code each denied retry added its
-#    reservation permanently, so a user who was over budget got pushed further over every
-#    time they retried and extended their own lockout. Several retries must leave the
-#    counter flat.
+#    Under the old code each denied retry added its reservation permanently, so a user who
+#    was over budget got pushed further over every time they retried and extended their own
+#    lockout. Several retries must leave BOTH counters flat.
 BUDGET_TMP, MX = "0.004", 400          # ~$0.006 reserved per call, so call #1 denies
-print("\n  (3) installing a temporary USER#bob budget to force a cost denial...")
+print("\n  (3) installing a temporary USER#bob daily budget to force a cost denial...")
 TMP_SCOPE, TMP_KIND = "USER#bob", "BUDGET"
 had = ddb.get_item(TableName=CONFIG_TABLE,
                    Key={"pk": {"S": TMP_SCOPE}, "sk": {"S": TMP_KIND}}).get("Item")
 try:
     ddb.put_item(TableName=CONFIG_TABLE, Item={
         "pk": {"S": TMP_SCOPE}, "sk": {"S": TMP_KIND},
-        "budget_usd": {"N": BUDGET_TMP}, "window_seconds": {"N": "60"},
+        "daily_budget_usd": {"N": BUDGET_TMP}, "monthly_budget_usd": {"N": "0"},
     })
     # The interceptor caches config; wait past the TTL or it enforces the old row.
     wait = config.CONFIG_CACHE_TTL_SECONDS + 3
     print(f"      waiting {wait}s for the interceptor's config cache to expire...")
     time.sleep(wait)
-    BUDGETS["bob"] = {"scope": TMP_SCOPE, "budget": float(BUDGET_TMP), "window": 60}
 
-    b3 = wait_for_fresh_bucket("bob", min_seconds_left=50)
-    before = spend("bob", b3)
+    day3, month3 = wait_for_room(min_seconds_left=120)
+    before = spend("bob", day3, month3)
     tries = []
     for _ in range(3):
         tries.append(post("bob", f"{BASE}/messages", body(SONNET, BENIGN, mx=MX)))
-        if bucket_of("bob") != b3:
+        if buckets() != (day3, month3):
             break
     print(f"      denied retries: {tries}")
     time.sleep(SETTLE_WAIT)
-    rolled = bucket_of("bob") != b3
-    after = spend("bob", b3)
-    d = after - before
+    rolled = buckets() != (day3, month3)
+    after = spend("bob", day3, month3)
+    d_day, d_month = after[0] - before[0], after[1] - before[1]
     all_denied = [t for t in tries if t[0] == 429 and "cost" in (t[1] or "").lower()]
+    label3 = f"3. cost_budget_exceeded x{len(tries)} retries"
     if rolled:
-        results.append(("3. cost_budget_exceeded (the worst case)", "SKIPPED",
-                        "window rolled mid-scenario", tries[0][0], tries[0][1]))
+        results.append((label3, "SKIPPED", "UTC day rolled mid-scenario",
+                        tries[0][0], tries[0][1]))
     elif len(all_denied) != len(tries):
-        results.append(("3. cost_budget_exceeded (the worst case)", "SKIPPED",
-                        f"did not get a cost denial: {tries}", tries[0][0], tries[0][1]))
+        results.append((label3, "SKIPPED", f"did not get a cost denial: {tries}",
+                        tries[0][0], tries[0][1]))
     else:
-        # NOTE the baseline here is legitimately $0.00, unlike the other scenarios: the
-        # temporary row uses a 60s window and this starts in a fresh bucket. That does not
-        # weaken the assertion -- under the old code these three denials would have added
-        # ~3 x $0.006 to that bucket, so 0 and 0.018 are what is being distinguished.
-        ok = abs(d) < 1e-9
-        results.append((f"3. cost_budget_exceeded x{len(tries)} retries",
-                        "PASS" if ok else "FAIL",
-                        f"${before:.6f} -> ${after:.6f} (delta ${d:+.6f}) "
+        ok = abs(d_day) < 1e-9 and abs(d_month) < 1e-9
+        results.append((label3, "PASS" if ok else "FAIL",
+                        f"day ${before[0]:.6f} -> ${after[0]:.6f} ({d_day:+.6f})  "
+                        f"month ${before[1]:.6f} -> ${after[1]:.6f} ({d_month:+.6f}) "
                         f"over {len(tries)} denials", tries[0][0], tries[0][1]))
 finally:
     if had:
